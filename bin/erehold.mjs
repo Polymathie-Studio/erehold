@@ -3,7 +3,11 @@
 //
 //   erehold add <anthropic|openai|gemini> store a provider key in the macOS keychain (hidden prompt)
 //   erehold import <path/to/.env>         copy provider keys from a .env file into the keychain
-//   erehold run [--pass VAR]... -- <cmd>  run a command with stand-ins in place of the keys
+//   erehold run [options] -- <cmd>        run a command with stand-ins in place of the keys
+//        --pass VAR           let one more environment variable through to the command
+//        --allow-read PATH    let the sandboxed command read one more folder
+//        --allow-write PATH   let the sandboxed command write one more folder
+//        --no-sandbox         run without the sandbox (holder level 2 instead of 3)
 //   erehold verify <record.jsonl>         check a session record's chain
 
 import { spawn, spawnSync } from "node:child_process";
@@ -13,6 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { startSession, verifyRecord, PROVIDERS, HOLDER_LEVEL } from "../src/session.mjs";
 import { keysFromEnvFile } from "../src/envfile.mjs";
+import { sandboxAvailable, sandboxCommand, SANDBOXED_LEVEL } from "../src/sandbox.mjs";
 
 const SERVICE = "erehold";
 const HOME = path.join(os.homedir(), ".erehold");
@@ -35,14 +40,22 @@ function recordKey() {
 }
 
 async function run(args) {
-  const pass = [];
+  const pass = [], allowRead = [], allowWrite = [];
+  let useSandbox = true;
   let i = 0;
   for (; i < args.length && args[i] !== "--"; i++) {
     if (args[i] === "--pass" && args[i + 1]) pass.push(args[++i]);
+    else if (args[i] === "--allow-read" && args[i + 1]) allowRead.push(path.resolve(args[++i]));
+    else if (args[i] === "--allow-write" && args[i + 1]) allowWrite.push(path.resolve(args[++i]));
+    else if (args[i] === "--no-sandbox") useSandbox = false;
     else { say(`unknown option ${args[i]}`); process.exit(2); }
   }
   const cmd = args.slice(i + 1);
-  if (!cmd.length) { say("usage: erehold run [--pass VAR]... -- <command> [args...]"); process.exit(2); }
+  if (!cmd.length) { say("usage: erehold run [--pass VAR] [--allow-read PATH] [--allow-write PATH] [--no-sandbox] -- <command> [args...]"); process.exit(2); }
+  if (useSandbox && !sandboxAvailable()) {
+    say("the sandbox runtime (srt) is not installed, so the command runs without it; install it with: npm install -g @anthropic-ai/sandbox-runtime");
+    useSandbox = false;
+  }
   const blocked = pass.filter((v) => Object.values(PROVIDERS).some((s) => [s.envKey, s.envBase, ...(s.alsoEnvKeys ?? [])].includes(v)));
   if (blocked.length) { say(`refusing to pass ${blocked.join(", ")}: erehold sets these itself`); process.exit(2); }
 
@@ -50,17 +63,24 @@ async function run(args) {
   for (const p of Object.keys(PROVIDERS)) { const v = keychainRead(p); if (v) secrets[p] = v; }
   if (!Object.keys(secrets).length) { say(`no keys stored; run \`erehold add <${Object.keys(PROVIDERS).join("|")}>\` or \`erehold import <.env>\` first`); process.exit(1); }
 
-  const session = await startSession({ secrets, recordDir: RECORDS, recordKey: recordKey() });
+  const holder = useSandbox ? SANDBOXED_LEVEL : HOLDER_LEVEL;
+  const session = await startSession({ secrets, recordDir: RECORDS, recordKey: recordKey(), holder });
   say(`session ${session.id}: ${Object.keys(secrets).join(", ")} via stand-ins`);
-  say(`holder ${HOLDER_LEVEL}`);
+  say(`holder ${holder}`);
   say(`record ${session.recordFile}`);
 
-  const child = spawn(cmd[0], cmd.slice(1), { stdio: "inherit", env: session.childEnv(process.env, pass) });
+  let launch = [cmd[0], cmd.slice(1)], sandbox = null;
+  if (useSandbox) {
+    sandbox = sandboxCommand({ port: session.port, cwd: process.cwd(), cmd, allowRead, allowWrite });
+    launch = ["srt", sandbox.argv];
+  }
+  const child = spawn(launch[0], launch[1], { stdio: "inherit", env: session.childEnv(process.env, pass) });
   const forward = (sig) => child.kill(sig);
   process.on("SIGINT", forward);
   process.on("SIGTERM", forward);
-  child.on("error", async (e) => { say(`could not start ${cmd[0]}: ${e.message}`); await session.close(null); process.exit(127); });
+  child.on("error", async (e) => { say(`could not start ${launch[0]}: ${e.message}`); sandbox?.cleanup(); await session.close(null); process.exit(127); });
   child.on("exit", async (code, signal) => {
+    sandbox?.cleanup();
     await session.close(code ?? signal);
     say(`session closed; check the record with: erehold verify "${session.recordFile}"`);
     process.exit(code ?? 1);
@@ -111,6 +131,6 @@ else if (cmd === "add") add(rest[0]);
 else if (cmd === "import") importEnv(rest[0]);
 else if (cmd === "verify") verify(rest[0]);
 else {
-  process.stderr.write(`usage:\n  erehold add <${Object.keys(PROVIDERS).join("|")}>\n  erehold import <path/to/.env>\n  erehold run [--pass VAR]... -- <command> [args...]\n  erehold verify <record.jsonl>\n`);
+  process.stderr.write(`usage:\n  erehold add <${Object.keys(PROVIDERS).join("|")}>\n  erehold import <path/to/.env>\n  erehold run [--pass VAR] [--allow-read PATH] [--allow-write PATH] [--no-sandbox] -- <command> [args...]\n  erehold verify <record.jsonl>\n`);
   process.exit(cmd ? 2 : 0);
 }

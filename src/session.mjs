@@ -109,7 +109,7 @@ export function verifyRecord(file) {
 //   recordDir: where the session record is written
 //   recordKey: secret used for the keyed fingerprints in the record
 //   upstream:  test hook only, { provider: "http://127.0.0.1:port" }; the CLI never sets it
-export async function startSession({ secrets, keyNames = {}, recordDir, recordKey, upstream = null }) {
+export async function startSession({ secrets, keyNames = {}, recordDir, recordKey, upstream = null, holder = HOLDER_LEVEL }) {
   const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
   const record = new Record(path.join(recordDir, `${id}.jsonl`), id);
   const held = new Map();
@@ -171,7 +171,7 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   record.write({
-    event: "open", holder: HOLDER_LEVEL,
+    event: "open", holder,
     keys: [...held.entries()].map(([p, e]) => ({ provider: p, key: e.name, fingerprint: fingerprint(e.value) })),
   });
 

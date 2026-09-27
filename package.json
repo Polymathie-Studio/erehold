@@ -1,11 +1,11 @@
 {
   "name": "erehold",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Keep AI provider keys out of the agents that use them: stand-ins in, real keys added only as a request leaves, every use recorded.",
   "license": "Apache-2.0",
   "type": "module",
   "bin": { "erehold": "bin/erehold.mjs" },
   "files": ["bin", "src", "README.md", "SPEC.md", "LICENSE", "LICENSE-SPEC", "NOTICE"],
   "engines": { "node": ">=20" },
-  "scripts": { "test": "node test/run.mjs" }
+  "scripts": { "test": "node test/run.mjs && node test/sandbox.mjs" }
 }
