@@ -7,6 +7,7 @@ import https from "node:https";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 // The destination for each provider is fixed here. Nothing the child sends can change it.
 export const PROVIDERS = {
@@ -69,10 +70,26 @@ function presented(req, url) {
   return null;
 }
 
+// How the shared ledger is protected. "system": the macOS system append-only flag, which only an
+// administrator can set or clear, so code running as you can add to the ledger but never rewrite
+// or delete it. "user": the owner's append-only flag, which the owner can clear. "none": neither.
+export function ledgerProtection(file) {
+  if (!fs.existsSync(file)) return "none";
+  const r = spawnSync("stat", ["-f", "%Sf", file], { encoding: "utf8" });
+  const flags = r.status === 0 ? r.stdout.trim().split(",") : [];
+  if (flags.includes("sappnd")) return "system";
+  if (flags.includes("uappnd")) return "user";
+  return "none";
+}
+
 // The session record: one JSON line per event, each carrying a hash of the line before it.
+// Every line goes to the session's own file and to the shared ledger. The chain catches an edited
+// or missing line; only the ledger's system append-only flag stops a full rewrite by code running
+// as you, because that code could recompute every hash.
 class Record {
-  constructor(file, session) {
+  constructor(file, session, ledgerFile = null) {
     this.file = file;
+    this.ledgerFile = ledgerFile;
     this.session = session;
     this.seq = 0;
     this.prev = "genesis";
@@ -81,9 +98,24 @@ class Record {
   write(entry) {
     const body = { seq: this.seq++, ts: new Date().toISOString(), session: this.session, ...entry, prev: this.prev };
     const hash = crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex");
-    fs.appendFileSync(this.file, JSON.stringify({ ...body, hash }) + "\n", { mode: 0o600 });
+    const line = JSON.stringify({ ...body, hash }) + "\n";
+    fs.appendFileSync(this.file, line, { mode: 0o600 });
+    if (this.ledgerFile) fs.appendFileSync(this.ledgerFile, line, { mode: 0o600 });
     this.prev = hash;
   }
+}
+
+// Compare a session's own record with its lines in the shared ledger. Returns { ok, error }.
+export function crossCheckLedger(sessionFile, ledgerFile) {
+  const own = fs.readFileSync(sessionFile, "utf8").split("\n").filter(Boolean);
+  if (!own.length) return { ok: false, error: "the session record is empty" };
+  const session = JSON.parse(own[0]).session;
+  const inLedger = fs.readFileSync(ledgerFile, "utf8").split("\n").filter(Boolean)
+    .filter((l) => { try { return JSON.parse(l).session === session; } catch { return false; } });
+  if (!inLedger.length) return { ok: false, error: "this session does not appear in the ledger" };
+  if (inLedger.length !== own.length) return { ok: false, error: `the ledger holds ${inLedger.length} lines for this session, the session file ${own.length}` };
+  for (let i = 0; i < own.length; i++) if (own[i] !== inLedger[i]) return { ok: false, error: `line ${i + 1} differs from the ledger` };
+  return { ok: true, error: null };
 }
 
 // Check a record file's chain. Returns { ok, lines, error }.
@@ -109,9 +141,9 @@ export function verifyRecord(file) {
 //   recordDir: where the session record is written
 //   recordKey: secret used for the keyed fingerprints in the record
 //   upstream:  test hook only, { provider: "http://127.0.0.1:port" }; the CLI never sets it
-export async function startSession({ secrets, keyNames = {}, recordDir, recordKey, upstream = null, holder = HOLDER_LEVEL }) {
+export async function startSession({ secrets, keyNames = {}, recordDir, recordKey, upstream = null, holder = HOLDER_LEVEL, ledgerFile = null }) {
   const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
-  const record = new Record(path.join(recordDir, `${id}.jsonl`), id);
+  const record = new Record(path.join(recordDir, `${id}.jsonl`), id, ledgerFile);
   const held = new Map();
   for (const [p, value] of Object.entries(secrets)) {
     if (!PROVIDERS[p]) throw new Error(`unknown provider: ${p}`);
@@ -172,6 +204,7 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
   const port = server.address().port;
   record.write({
     event: "open", holder,
+    ledger: ledgerFile ? { file: ledgerFile, protection: ledgerProtection(ledgerFile) } : null,
     keys: [...held.entries()].map(([p, e]) => ({ provider: p, key: e.name, fingerprint: fingerprint(e.value) })),
   });
 

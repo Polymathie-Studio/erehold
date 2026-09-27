@@ -1,6 +1,6 @@
 {
   "name": "erehold",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Keep AI provider keys out of the agents that use them: stand-ins in, real keys added only as a request leaves, every use recorded.",
   "license": "Apache-2.0",
   "type": "module",

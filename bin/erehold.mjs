@@ -8,20 +8,27 @@
 //        --allow-read PATH    let the sandboxed command read one more folder
 //        --allow-write PATH   let the sandboxed command write one more folder
 //        --no-sandbox         run without the sandbox (holder level 2 instead of 3)
-//   erehold verify <record.jsonl>         check a session record's chain
+//   erehold verify <record.jsonl>         check a session record's chain, and compare it with the ledger
+//   erehold protect                       lock the shared ledger so it can only be added to
 
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startSession, verifyRecord, PROVIDERS, HOLDER_LEVEL } from "../src/session.mjs";
+import { startSession, verifyRecord, crossCheckLedger, ledgerProtection, PROVIDERS, HOLDER_LEVEL } from "../src/session.mjs";
 import { keysFromEnvFile } from "../src/envfile.mjs";
 import { sandboxAvailable, sandboxCommand, SANDBOXED_LEVEL } from "../src/sandbox.mjs";
 
 const SERVICE = "erehold";
 const HOME = path.join(os.homedir(), ".erehold");
 const RECORDS = path.join(HOME, "records");
+const LEDGER = path.join(HOME, "ledger.jsonl");
+const PROTECTION = {
+  system: "the ledger is locked: code running as you can add to it but never rewrite or delete it",
+  user: "the ledger has only the owner's append-only flag, which code running as you can clear; run `erehold protect`",
+  none: "the ledger is not locked, so code running as you could rewrite it; run `erehold protect`",
+};
 const say = (m) => process.stderr.write(`erehold: ${m}\n`);
 
 function keychainRead(provider) {
@@ -64,10 +71,12 @@ async function run(args) {
   if (!Object.keys(secrets).length) { say(`no keys stored; run \`erehold add <${Object.keys(PROVIDERS).join("|")}>\` or \`erehold import <.env>\` first`); process.exit(1); }
 
   const holder = useSandbox ? SANDBOXED_LEVEL : HOLDER_LEVEL;
-  const session = await startSession({ secrets, recordDir: RECORDS, recordKey: recordKey(), holder });
+  if (!fs.existsSync(LEDGER)) { fs.mkdirSync(HOME, { recursive: true, mode: 0o700 }); fs.writeFileSync(LEDGER, "", { mode: 0o600 }); }
+  const session = await startSession({ secrets, recordDir: RECORDS, recordKey: recordKey(), holder, ledgerFile: LEDGER });
   say(`session ${session.id}: ${Object.keys(secrets).join(", ")} via stand-ins`);
   say(`holder ${holder}`);
   say(`record ${session.recordFile}`);
+  say(PROTECTION[ledgerProtection(LEDGER)]);
 
   let launch = [cmd[0], cmd.slice(1)], sandbox = null;
   if (useSandbox) {
@@ -120,8 +129,22 @@ function importEnv(file) {
 function verify(file) {
   if (!file || !fs.existsSync(file)) { say("usage: erehold verify <record.jsonl>"); process.exit(2); }
   const r = verifyRecord(file);
-  if (r.ok) { say(`record intact: ${r.lines} lines, chain verified`); process.exit(0); }
-  say(`record FAILED verification: ${r.error}`);
+  if (!r.ok) { say(`record FAILED verification: ${r.error}`); process.exit(1); }
+  say(`record intact: ${r.lines} lines, chain verified`);
+  if (!fs.existsSync(LEDGER)) { say("no ledger to compare with"); process.exit(0); }
+  const c = crossCheckLedger(file, LEDGER);
+  if (!c.ok) { say(`record DIFFERS from the ledger: ${c.error}`); process.exit(1); }
+  say(`record matches the ledger; ${PROTECTION[ledgerProtection(LEDGER)]}`);
+  process.exit(0);
+}
+
+function protect() {
+  if (!fs.existsSync(LEDGER)) { fs.mkdirSync(HOME, { recursive: true, mode: 0o700 }); fs.writeFileSync(LEDGER, "", { mode: 0o600 }); }
+  const p = ledgerProtection(LEDGER);
+  if (p === "system") { say(PROTECTION.system); process.exit(0); }
+  say("to lock the ledger so it can only be added to, run this once (it asks for your Mac password):");
+  process.stdout.write(`sudo chflags sappnd "${LEDGER}"\n`);
+  say("undoing it later also needs administrator rights: sudo chflags nosappnd <ledger>");
   process.exit(1);
 }
 
@@ -130,7 +153,8 @@ if (cmd === "run") await run(rest);
 else if (cmd === "add") add(rest[0]);
 else if (cmd === "import") importEnv(rest[0]);
 else if (cmd === "verify") verify(rest[0]);
+else if (cmd === "protect") protect();
 else {
-  process.stderr.write(`usage:\n  erehold add <${Object.keys(PROVIDERS).join("|")}>\n  erehold import <path/to/.env>\n  erehold run [--pass VAR] [--allow-read PATH] [--allow-write PATH] [--no-sandbox] -- <command> [args...]\n  erehold verify <record.jsonl>\n`);
+  process.stderr.write(`usage:\n  erehold add <${Object.keys(PROVIDERS).join("|")}>\n  erehold import <path/to/.env>\n  erehold run [--pass VAR] [--allow-read PATH] [--allow-write PATH] [--no-sandbox] -- <command> [args...]\n  erehold verify <record.jsonl>\n  erehold protect\n`);
   process.exit(cmd ? 2 : 0);
 }

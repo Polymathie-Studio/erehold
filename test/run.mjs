@@ -8,7 +8,9 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { startSession, verifyRecord } from "../src/session.mjs";
+import { startSession, verifyRecord, crossCheckLedger, ledgerProtection } from "../src/session.mjs";
+import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { keysFromEnvFile } from "../src/envfile.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -131,6 +133,40 @@ check("9. .env import reads all three provider keys, quoted or not, and nothing 
   fromEnv.anthropic === CANARY_A && fromEnv.openai === CANARY_O && fromEnv.gemini === CANARY_G && Object.keys(fromEnv).length === 3);
 check("9. .env import names the keys it does not handle instead of skipping them silently",
   ["MISTRAL_API_KEY", "GITHUB_TOKEN", "OTHER_SECRET"].every((n) => unsupported.includes(n)) && unsupported.length === 3);
+
+// 10. The shared ledger: a full rewrite of a session file passes its own chain check but not the
+// comparison with the ledger, and an append-only ledger refuses rewriting while accepting additions.
+const ledgerDir = fs.mkdtempSync(path.join(os.tmpdir(), "erehold-ledger-"));
+const ledger = path.join(ledgerDir, "ledger.jsonl");
+fs.writeFileSync(ledger, "", { mode: 0o600 });
+check("10. an unflagged ledger reports no protection", ledgerProtection(ledger) === "none");
+execFileSync("chflags", ["uappnd", ledger]);
+check("10. the owner's append-only flag is reported as user-level, not system", ledgerProtection(ledger) === "user");
+const s2 = await startSession({ secrets: { anthropic: CANARY_A }, recordDir: ledgerDir, recordKey: "k", upstream: { anthropic: UP }, ledgerFile: ledger });
+await fetch(`http://127.0.0.1:${s2.port}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": s2.childEnv({}).ANTHROPIC_API_KEY }, body: "{}" });
+await s2.close(0);
+check("10. every session line also reaches the ledger, and the two match", crossCheckLedger(s2.recordFile, ledger).ok);
+check("10. the session's open line declares the ledger's protection",
+  JSON.parse(fs.readFileSync(s2.recordFile, "utf8").split("\n")[0]).ledger?.protection === "user");
+// Rewrite the session file consistently, recomputing every hash, as code running as you could.
+const forged = []; let prev = "genesis";
+for (const l of fs.readFileSync(s2.recordFile, "utf8").split("\n").filter(Boolean)) {
+  const { hash, ...body } = JSON.parse(l);
+  if (body.event === "request") body.status = 418;
+  body.prev = prev;
+  const h = crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex");
+  forged.push(JSON.stringify({ ...body, hash: h })); prev = h;
+}
+fs.writeFileSync(s2.recordFile, forged.join("\n") + "\n");
+check("10. a full, consistent rewrite of the session file still passes its own chain check", verifyRecord(s2.recordFile).ok);
+check("10. but the comparison with the ledger catches it", !crossCheckLedger(s2.recordFile, ledger).ok);
+let rewriteRefused = false;
+try { fs.writeFileSync(ledger, "rewritten\n"); } catch (e) { rewriteRefused = e.code === "EPERM"; }
+let appendWorked = false;
+try { fs.appendFileSync(ledger, ""); appendWorked = true; } catch {}
+check("10. the append-only ledger refuses rewriting and still accepts additions", rewriteRefused && appendWorked);
+execFileSync("chflags", ["nouappnd", ledger]);
+fs.rmSync(ledgerDir, { recursive: true, force: true });
 
 fake.close();
 fs.rmSync(recordDir, { recursive: true, force: true });
