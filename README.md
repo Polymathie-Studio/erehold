@@ -7,7 +7,7 @@
 
 **EREHOLD** (said "AIR-hold") is an approach to keeping secrets safe in terminals and in the AI agents that now run in them. *Ere* means *before*. A secret is held until the moment it has to leave, released only there, at the threshold, and every crossing is asked about and recorded.
 
-The principle in one line: **the untrusted party never holds the value.**
+The principle in one line: **code you have not verified never holds the value.**
 
 Concept note, 2026-09-27. This is a working concept, not yet a specification and not yet software. Parts marked as open are still being worked out.
 
@@ -39,7 +39,7 @@ The exact set of protections, and a test that each one fails independently of th
 
 Where must the secret's value exist for it to work? There are three answers, and they form a ladder.
 
-1. **Inside a local program that must hold the value itself** (a database password, a program that reads a key file). This is the weakest place. A value an untrusted program must hold cannot be kept from it; it can only be made short-lived and narrowly scoped.
+1. **Inside a local program that must hold the value itself** (a database password, a program that reads a key file). This is the weakest place. A value that an unverified program must hold cannot be kept from it; it can only be made short-lived and narrowly scoped.
 2. **Inside an outbound request** (API keys, registry tokens, git over HTTPS). The agent gets a stand-in, and the real value is swapped in only as the request leaves, only toward the destinations that secret is bound to.
 3. **Inside a signature or proof** (SSH keys, signing keys, certificates). The holder signs on request and the key never travels. This is the strongest place.
 
@@ -51,7 +51,7 @@ EREHOLD's main move is to push each secret up the ladder. This already ships in 
 
 ## Where the holder lives decides how much is protected
 
-The strength of every protection depends on how far the holder of the value is kept from the untrusted code:
+The strength of every protection depends on how far the holder of the value is kept from the code you have not verified:
 
 1. **In the same process as the agent.** Stand-ins keep values out of the agent's context and transcripts, but code in that process can read memory.
 2. **In a separate process, as the same user** (a local broker, `ssh-agent`). The agent cannot copy the value but can ask the holder to use it, and a same-user attacker can often reach the holder.
@@ -68,10 +68,10 @@ After an incident like LiteLLM's, that record is the difference between "rotate 
 
 ## What EREHOLD can reduce but not remove
 
-- **A destination misusing what it legitimately receives.** Key-bound tokens stop a stolen copy from being replayed elsewhere; what the rightful destination does with a real credential can only be bounded by scope, expiry, and the destination's own logs.
+- **A destination misusing what it is sent on purpose.** Key-bound tokens stop a stolen copy from being replayed elsewhere; what the rightful destination does with a real credential can only be bounded by scope, expiry, and the destination's own logs.
 - **The person approving what they did not read.** Fewer, clearer, and physically confirmed asks make this rarer; they do not make it impossible.
-- **Resources that support neither delegation nor certificates.** For these, the value must be held; it can only be made short-lived and narrowly scoped.
-- **Covert channels.** Lampson's 1973 "A Note on the Confinement Problem" observes that "there is not likely to be any rigorous way of identifying every channel in any system of even moderate complexity," and offers the practical answer: bound the capacity of the covert channels. For secrets EREHOLD brokers, the agent never holds the value, so there is nothing for it to leak; the remaining exposure is the data the agent legitimately sees.
+- **Resources that accept neither short-lived tokens nor certificates.** For these, the value must be held; it can only be made short-lived and narrowly scoped.
+- **Covert channels.** Lampson's 1973 "A Note on the Confinement Problem" observes that "there is not likely to be any rigorous way of identifying every channel in any system of even moderate complexity," and offers the practical answer: bound the capacity of the covert channels. For secrets EREHOLD brokers, the agent never holds the value, so there is nothing for it to leak; the remaining exposure is the data the agent is given to work with.
 
 ## What would show this wrong
 
