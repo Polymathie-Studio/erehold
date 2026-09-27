@@ -9,7 +9,7 @@
 
 The principle in one line: **code you have not verified never holds the value.**
 
-Concept note, 2026-09-27. This is a working concept, not yet a specification and not yet software. Parts marked as open are still being worked out.
+Concept note, 2026-09-27. The approach below is still being worked out; the first working software, for AI provider keys only, is described in `SPEC.md`.
 
 ---
 
@@ -88,7 +88,7 @@ What EREHOLD adds is the combination: one question that sorts every terminal sec
 
 ## Names
 
-**EREHOLD** (uppercase) names the principle and, in time, the conformance designation. **erehold** (lowercase) names the software that implements it. The software does not exist yet.
+**EREHOLD** (uppercase) names the principle and, in time, the conformance designation. **erehold** (lowercase) names the software that implements it. Version 0.1, which protects AI provider keys, is in this repository; `SPEC.md` says what it does, what it claims, and how it is tested.
 
 ## Author and licence
 
