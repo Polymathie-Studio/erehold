@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // erehold command-line tool. See SPEC.md.
 //
-//   erehold add <anthropic|openai>        store a provider key in the macOS keychain (hidden prompt)
+//   erehold add <anthropic|openai|gemini> store a provider key in the macOS keychain (hidden prompt)
 //   erehold import <path/to/.env>         copy provider keys from a .env file into the keychain
 //   erehold run [--pass VAR]... -- <cmd>  run a command with stand-ins in place of the keys
 //   erehold verify <record.jsonl>         check a session record's chain
@@ -43,12 +43,12 @@ async function run(args) {
   }
   const cmd = args.slice(i + 1);
   if (!cmd.length) { say("usage: erehold run [--pass VAR]... -- <command> [args...]"); process.exit(2); }
-  const blocked = pass.filter((v) => Object.values(PROVIDERS).some((s) => s.envKey === v || s.envBase === v));
+  const blocked = pass.filter((v) => Object.values(PROVIDERS).some((s) => [s.envKey, s.envBase, ...(s.alsoEnvKeys ?? [])].includes(v)));
   if (blocked.length) { say(`refusing to pass ${blocked.join(", ")}: erehold sets these itself`); process.exit(2); }
 
   const secrets = {};
   for (const p of Object.keys(PROVIDERS)) { const v = keychainRead(p); if (v) secrets[p] = v; }
-  if (!Object.keys(secrets).length) { say("no keys stored; run `erehold add anthropic` or `erehold add openai` first"); process.exit(1); }
+  if (!Object.keys(secrets).length) { say(`no keys stored; run \`erehold add <${Object.keys(PROVIDERS).join("|")}>\` or \`erehold import <.env>\` first`); process.exit(1); }
 
   const session = await startSession({ secrets, recordDir: RECORDS, recordKey: recordKey() });
   say(`session ${session.id}: ${Object.keys(secrets).join(", ")} via stand-ins`);
@@ -87,7 +87,8 @@ function keychainWrite(provider, value) {
 
 function importEnv(file) {
   if (!file || !fs.existsSync(file)) { say("usage: erehold import <path/to/.env>"); process.exit(2); }
-  const found = keysFromEnvFile(fs.readFileSync(file, "utf8"));
+  const { found, unsupported } = keysFromEnvFile(fs.readFileSync(file, "utf8"));
+  for (const name of unsupported) say(`${name}: skipped; erehold does not handle this key yet, so it stays only in the file`);
   if (!Object.keys(found).length) { say(`no provider keys found in ${file} (looked for ${Object.values(PROVIDERS).map((s) => s.envKey).join(", ")})`); process.exit(1); }
   for (const [p, value] of Object.entries(found)) {
     if (keychainWrite(p, value)) say(`${PROVIDERS[p].envKey}: stored in the keychain as "${p}"`);
@@ -110,6 +111,6 @@ else if (cmd === "add") add(rest[0]);
 else if (cmd === "import") importEnv(rest[0]);
 else if (cmd === "verify") verify(rest[0]);
 else {
-  process.stderr.write("usage:\n  erehold add <anthropic|openai>\n  erehold import <path/to/.env>\n  erehold run [--pass VAR]... -- <command> [args...]\n  erehold verify <record.jsonl>\n");
+  process.stderr.write(`usage:\n  erehold add <${Object.keys(PROVIDERS).join("|")}>\n  erehold import <path/to/.env>\n  erehold run [--pass VAR]... -- <command> [args...]\n  erehold verify <record.jsonl>\n`);
   process.exit(cmd ? 2 : 0);
 }

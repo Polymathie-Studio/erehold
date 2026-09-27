@@ -24,6 +24,17 @@ export const PROVIDERS = {
     basePath: "/v1",
     setAuth: (headers, key) => { headers["authorization"] = `Bearer ${key}`; },
   },
+  // Google's libraries read GEMINI_API_KEY or GOOGLE_API_KEY (GOOGLE_API_KEY wins), so the child
+  // gets the stand-in under both. They take a different address only in code, so GEMINI_BASE_URL
+  // is erehold's own variable: a program passes it as its base URL.
+  gemini: {
+    host: "generativelanguage.googleapis.com",
+    envKey: "GEMINI_API_KEY",
+    alsoEnvKeys: ["GOOGLE_API_KEY"],
+    envBase: "GEMINI_BASE_URL",
+    basePath: "",
+    setAuth: (headers, key) => { headers["x-goog-api-key"] = key; },
+  },
 };
 
 // Only these variables pass from erehold's environment to the child.
@@ -34,7 +45,7 @@ const ENV_ALLOW = [
 
 // Headers never forwarded upstream: credentials the child sent, and hop-by-hop headers.
 const STRIP = new Set([
-  "host", "x-api-key", "authorization", "proxy-authorization", "connection", "keep-alive",
+  "host", "x-api-key", "x-goog-api-key", "authorization", "proxy-authorization", "connection", "keep-alive",
   "proxy-connection", "transfer-encoding", "upgrade", "te", "trailer",
 ]);
 
@@ -49,9 +60,10 @@ function sameValue(a, b) {
   return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
-function presented(req) {
-  const k = req.headers["x-api-key"];
+function presented(req, url) {
+  const k = req.headers["x-api-key"] ?? req.headers["x-goog-api-key"];
   if (k) return String(k);
+  if (url.searchParams.has("key")) return url.searchParams.get("key");
   const a = req.headers["authorization"];
   if (a && /^Bearer\s+/i.test(a)) return a.replace(/^Bearer\s+/i, "");
   return null;
@@ -122,7 +134,7 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
     };
     if (!open) return refuse(503, "refused: session closed");
     if (!entry) return refuse(404, "refused: unknown provider");
-    const got = presented(req);
+    const got = presented(req, url);
     if (!got || !sameValue(got, entry.standin)) return refuse(403, "refused: not this session's stand-in");
 
     const spec = PROVIDERS[p];
@@ -132,6 +144,7 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
     const target = upstream?.[p] ? new URL(upstream[p]) : new URL(`https://${spec.host}`);
     headers.host = target.host;
     const lib = target.protocol === "http:" ? http : https;
+    url.searchParams.delete("key"); // a key sent in the address travels as a header instead
     let bytesOut = 0;
     req.on("data", (c) => { bytesOut += c.length; });
     const up = lib.request({
@@ -172,6 +185,7 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
       for (const k of [...ENV_ALLOW, ...pass]) if (parentEnv[k] !== undefined) env[k] = parentEnv[k];
       for (const [p, e] of held) {
         env[PROVIDERS[p].envKey] = e.standin;
+        for (const k of PROVIDERS[p].alsoEnvKeys ?? []) env[k] = e.standin;
         env[PROVIDERS[p].envBase] = `http://127.0.0.1:${port}/${p}${PROVIDERS[p].basePath}`;
       }
       return env;

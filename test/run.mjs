@@ -14,6 +14,7 @@ import { keysFromEnvFile } from "../src/envfile.mjs";
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const CANARY_A = "sk-ant-FAKE-canary-7f3e9a1c5b2d4e6f8a0b";
 const CANARY_O = "sk-FAKE-openai-canary-2c4e6a8b0d1f3e5a7c9b";
+const CANARY_G = "AIzaFAKE-gemini-canary-9d8c7b6a5f4e3d2c1b0a";
 
 let passed = 0, failed = 0;
 const check = (name, ok) => { ok ? passed++ : failed++; console.log(`${ok ? "PASS" : "FAIL"}  ${name}`); };
@@ -21,7 +22,7 @@ const check = (name, ok) => { ok ? passed++ : failed++; console.log(`${ok ? "PAS
 // Fake provider: records the credentials it receives, answers "ok", never echoes a key.
 const seen = [];
 const fake = http.createServer((req, res) => {
-  seen.push({ path: req.url, xApiKey: req.headers["x-api-key"] ?? null, auth: req.headers["authorization"] ?? null });
+  seen.push({ path: req.url, xApiKey: req.headers["x-api-key"] ?? null, auth: req.headers["authorization"] ?? null, goog: req.headers["x-goog-api-key"] ?? null });
   req.resume();
   req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end('{"reply":"ok"}'); });
 });
@@ -30,20 +31,22 @@ const UP = `http://127.0.0.1:${fake.address().port}`;
 
 const recordDir = fs.mkdtempSync(path.join(os.tmpdir(), "erehold-test-"));
 const session = await startSession({
-  secrets: { anthropic: CANARY_A, openai: CANARY_O },
-  keyNames: { anthropic: "test-anthropic", openai: "test-openai" },
-  recordDir, recordKey: "test-record-key", upstream: { anthropic: UP, openai: UP },
+  secrets: { anthropic: CANARY_A, openai: CANARY_O, gemini: CANARY_G },
+  keyNames: { anthropic: "test-anthropic", openai: "test-openai", gemini: "test-gemini" },
+  recordDir, recordKey: "test-record-key", upstream: { anthropic: UP, openai: UP, gemini: UP },
 });
 
 // A child program sees only what erehold gives it. It prints its environment and arguments,
 // then makes the same calls an SDK would, using only what is in its environment.
 const childScript = `
   const out = { env: process.env, argv: process.argv, results: {} };
-  const A = process.env.ANTHROPIC_BASE_URL, O = process.env.OPENAI_BASE_URL;
+  const A = process.env.ANTHROPIC_BASE_URL, O = process.env.OPENAI_BASE_URL, G = process.env.GEMINI_BASE_URL;
   const post = (u, h) => fetch(u, { method: "POST", headers: { "content-type": "application/json", ...h }, body: "{}" })
     .then(async r => ({ status: r.status, body: await r.text() }));
   out.results.anthropicGood = await post(A + "/v1/messages", { "x-api-key": process.env.ANTHROPIC_API_KEY });
   out.results.openaiGood = await post(O + "/chat/completions", { authorization: "Bearer " + process.env.OPENAI_API_KEY });
+  out.results.geminiHeader = await post(G + "/v1beta/models/m:generateContent", { "x-goog-api-key": process.env.GEMINI_API_KEY });
+  out.results.geminiQuery = await post(G + "/v1beta/models/m:generateContent?key=" + process.env.GOOGLE_API_KEY, {});
   out.results.anthropicWrong = await post(A + "/v1/messages", { "x-api-key": "sk-ant-guessed-value" });
   out.results.anthropicNone = await post(A + "/v1/messages", {});
   out.results.unknownProvider = await post(A.replace("/anthropic", "/elsewhere") + "/v1/x", { "x-api-key": process.env.ANTHROPIC_API_KEY });
@@ -60,7 +63,7 @@ const res = child.results ?? {};
 
 // 1. The fake key appears nowhere the child can see.
 check("1. the real key is not in the child's environment, arguments, or output",
-  !childOut.includes(CANARY_A) && !childOut.includes(CANARY_O));
+  !childOut.includes(CANARY_A) && !childOut.includes(CANARY_O) && !childOut.includes(CANARY_G));
 check("1. the child holds stand-ins, not keys",
   child.env?.ANTHROPIC_API_KEY?.startsWith("erehold-standin-anthropic-") && child.env?.OPENAI_API_KEY?.startsWith("erehold-standin-openai-"));
 
@@ -68,15 +71,20 @@ check("1. the child holds stand-ins, not keys",
 check("2. a secret set in erehold's environment does not reach the child", child.env && !("FAKE_PARENT_SECRET" in child.env));
 
 // 3. The session stand-in reaches the provider as the real key.
-const hits = seen.filter((s) => s.path === "/v1/messages" || s.path === "/v1/chat/completions");
+const hits = seen;
 check("3. anthropic: the provider receives the real key", res.anthropicGood?.status === 200 && hits.some((s) => s.xApiKey === CANARY_A));
 check("3. openai: the provider receives the real key", res.openaiGood?.status === 200 && hits.some((s) => s.auth === `Bearer ${CANARY_O}`));
-check("3. the provider never receives a stand-in", !seen.some((s) => String(s.xApiKey ?? s.auth ?? "").includes("erehold-standin")));
+check("3. gemini: the provider receives the real key, by header or by key= in the address",
+  res.geminiHeader?.status === 200 && res.geminiQuery?.status === 200 && seen.filter((s) => s.goog === CANARY_G).length === 2);
+check("3. gemini: a key sent in the address is removed from the address", !seen.some((s) => s.path.includes("key=")));
+check("1. gemini stand-in is given under both GEMINI_API_KEY and GOOGLE_API_KEY",
+  child.env?.GEMINI_API_KEY?.startsWith("erehold-standin-gemini-") && child.env?.GOOGLE_API_KEY === child.env?.GEMINI_API_KEY);
+check("3. the provider never receives a stand-in", !seen.some((s) => JSON.stringify(s).includes("erehold-standin")));
 
 // 4. Any other value is refused and never forwarded.
 check("4. a wrong value is refused (403)", res.anthropicWrong?.status === 403);
 check("4. a missing value is refused (403)", res.anthropicNone?.status === 403);
-check("4. refused requests never reach the provider", seen.length === 2);
+check("4. refused requests never reach the provider", seen.length === 4);
 
 // 5. An unknown provider path is refused.
 check("5. an unknown provider path is refused (404)", res.unknownProvider?.status === 404);
@@ -88,17 +96,17 @@ await session.close(0);
 let afterClose;
 try { afterClose = (await fetch(baseA + "/v1/messages", { method: "POST", headers: { "x-api-key": standinA }, body: "{}" })).status; }
 catch { afterClose = "connection refused"; }
-check("7. after close, the stand-in no longer works", afterClose !== 200 && seen.length === 2);
+check("7. after close, the stand-in no longer works", afterClose !== 200 && seen.length === 4);
 
 // 6. One record line per request, no key in the record, and the chain catches tampering.
 const recText = fs.readFileSync(session.recordFile, "utf8");
 const lines = recText.split("\n").filter(Boolean).map((l) => JSON.parse(l));
 const requests = lines.filter((l) => l.event === "request");
-check("6. one record line per request (5 requests)", requests.length === 5);
+check("6. one record line per request (7 requests)", requests.length === 7);
 check("6. forwarded requests are recorded with key name and fingerprint",
   requests.filter((l) => l.outcome === "forwarded").every((l) => l.key && /^[0-9a-f]{32}$/.test(l.fingerprint)));
 check("6. the record never contains a key or a stand-in",
-  !recText.includes(CANARY_A) && !recText.includes(CANARY_O) && !recText.includes("erehold-standin"));
+  !recText.includes(CANARY_A) && !recText.includes(CANARY_O) && !recText.includes(CANARY_G) && !recText.includes("erehold-standin"));
 check("6. the record opens and closes", lines[0].event === "open" && lines.at(-1).event === "close");
 check("6. the chain verifies", verifyRecord(session.recordFile).ok);
 const edited = path.join(recordDir, "edited.jsonl");
@@ -116,10 +124,13 @@ check("8. the package declares no dependencies", !pkg.dependencies && !pkg.devDe
 const envText = [
   "# comment", "OTHER_SECRET=nope", `export ANTHROPIC_API_KEY="${CANARY_A}"`,
   `OPENAI_API_KEY=${CANARY_O}   # trailing comment`, "ANTHROPIC_BASE_URL=http://x",
+  `GEMINI_API_KEY='${CANARY_G}'`, "MISTRAL_API_KEY=abc123", "GITHUB_TOKEN=ghp_x",
 ].join("\n");
-const fromEnv = keysFromEnvFile(envText);
-check("9. .env import reads both provider keys, quoted or not, and nothing else",
-  fromEnv.anthropic === CANARY_A && fromEnv.openai === CANARY_O && Object.keys(fromEnv).length === 2);
+const { found: fromEnv, unsupported } = keysFromEnvFile(envText);
+check("9. .env import reads all three provider keys, quoted or not, and nothing else",
+  fromEnv.anthropic === CANARY_A && fromEnv.openai === CANARY_O && fromEnv.gemini === CANARY_G && Object.keys(fromEnv).length === 3);
+check("9. .env import names the keys it does not handle instead of skipping them silently",
+  ["MISTRAL_API_KEY", "GITHUB_TOKEN", "OTHER_SECRET"].every((n) => unsupported.includes(n)) && unsupported.length === 3);
 
 fake.close();
 fs.rmSync(recordDir, { recursive: true, force: true });
