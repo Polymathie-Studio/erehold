@@ -2,6 +2,7 @@
 // erehold command-line tool. See SPEC.md.
 //
 //   erehold add <anthropic|openai>        store a provider key in the macOS keychain (hidden prompt)
+//   erehold import <path/to/.env>         copy provider keys from a .env file into the keychain
 //   erehold run [--pass VAR]... -- <cmd>  run a command with stand-ins in place of the keys
 //   erehold verify <record.jsonl>         check a session record's chain
 
@@ -11,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { startSession, verifyRecord, PROVIDERS, HOLDER_LEVEL } from "../src/session.mjs";
+import { keysFromEnvFile } from "../src/envfile.mjs";
 
 const SERVICE = "erehold";
 const HOME = path.join(os.homedir(), ".erehold");
@@ -73,6 +75,27 @@ function add(provider) {
   say(`${provider} key stored in the keychain under service "${SERVICE}"`);
 }
 
+// Store a key without it ever appearing in a command line: the keychain tool reads the
+// command from standard input, so no other program can see the value in a process listing.
+function keychainWrite(provider, value) {
+  if (!/^[A-Za-z0-9_\-.]+$/.test(value)) return false;
+  const r = spawnSync("security", ["-i"], {
+    input: `add-generic-password -U -s ${SERVICE} -a ${provider} -w ${value}\n`, encoding: "utf8",
+  });
+  return r.status === 0 && keychainRead(provider) === value;
+}
+
+function importEnv(file) {
+  if (!file || !fs.existsSync(file)) { say("usage: erehold import <path/to/.env>"); process.exit(2); }
+  const found = keysFromEnvFile(fs.readFileSync(file, "utf8"));
+  if (!Object.keys(found).length) { say(`no provider keys found in ${file} (looked for ${Object.values(PROVIDERS).map((s) => s.envKey).join(", ")})`); process.exit(1); }
+  for (const [p, value] of Object.entries(found)) {
+    if (keychainWrite(p, value)) say(`${PROVIDERS[p].envKey}: stored in the keychain as "${p}"`);
+    else say(`${PROVIDERS[p].envKey}: NOT stored (unexpected characters, or the keychain refused); use \`erehold add ${p}\``);
+  }
+  say(`${file} was not changed and still holds these keys in plain text; any program running as you can read it`);
+}
+
 function verify(file) {
   if (!file || !fs.existsSync(file)) { say("usage: erehold verify <record.jsonl>"); process.exit(2); }
   const r = verifyRecord(file);
@@ -84,8 +107,9 @@ function verify(file) {
 const [cmd, ...rest] = process.argv.slice(2);
 if (cmd === "run") await run(rest);
 else if (cmd === "add") add(rest[0]);
+else if (cmd === "import") importEnv(rest[0]);
 else if (cmd === "verify") verify(rest[0]);
 else {
-  process.stderr.write("usage:\n  erehold add <anthropic|openai>\n  erehold run [--pass VAR]... -- <command> [args...]\n  erehold verify <record.jsonl>\n");
+  process.stderr.write("usage:\n  erehold add <anthropic|openai>\n  erehold import <path/to/.env>\n  erehold run [--pass VAR]... -- <command> [args...]\n  erehold verify <record.jsonl>\n");
   process.exit(cmd ? 2 : 0);
 }

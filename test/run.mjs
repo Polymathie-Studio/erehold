@@ -9,6 +9,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startSession, verifyRecord } from "../src/session.mjs";
+import { keysFromEnvFile } from "../src/envfile.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const CANARY_A = "sk-ant-FAKE-canary-7f3e9a1c5b2d4e6f8a0b";
@@ -110,6 +111,15 @@ check("6. a deleted line fails verification", !verifyRecord(cut).ok);
 // 8. No dependencies.
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
 check("8. the package declares no dependencies", !pkg.dependencies && !pkg.devDependencies && !pkg.optionalDependencies);
+
+// 9. Keys are read correctly out of a .env file.
+const envText = [
+  "# comment", "OTHER_SECRET=nope", `export ANTHROPIC_API_KEY="${CANARY_A}"`,
+  `OPENAI_API_KEY=${CANARY_O}   # trailing comment`, "ANTHROPIC_BASE_URL=http://x",
+].join("\n");
+const fromEnv = keysFromEnvFile(envText);
+check("9. .env import reads both provider keys, quoted or not, and nothing else",
+  fromEnv.anthropic === CANARY_A && fromEnv.openai === CANARY_O && Object.keys(fromEnv).length === 2);
 
 fake.close();
 fs.rmSync(recordDir, { recursive: true, force: true });
