@@ -41,6 +41,7 @@ Out of scope for now: other secret kinds (SSH and signing keys, database passwor
 
 - No outside packages. The core uses only Node's built-in modules, because the protecting part must be the hardest thing on the machine to poison.
 - Refuse rather than guess: an unknown stand-in, an unknown provider path, or a missing key is refused, and the refusal is recorded.
+- Write before acting: a request is recorded as forwarding before the real key leaves. If that line cannot be written (a full disk, a broken file), the request is refused and never sent, and the relay refuses everything after it until a new session starts. An action that cannot be recorded does not happen.
 - The destination for each provider is fixed in code. Nothing in the child's environment or the request can redirect a real key.
 - Test hooks (a fake upstream, a secret source other than the keychain) exist only in the library interface used by the tests. The command-line tool cannot reach them.
 
@@ -70,5 +71,6 @@ Ledger checks, in `test/run.mjs`:
 14. Every session line reaches the ledger, and the session's opening line declares the ledger's protection.
 15. A full, consistent rewrite of a session file passes its own chain check but fails the comparison with the ledger.
 16. An append-only ledger refuses rewriting and still accepts additions.
+17. With the record unwritable, a request is refused and never reaches the provider, and erehold keeps running and keeps refusing rather than crashing.
 
 One live run against the real Anthropic API completes end to end, done by hand with a real key.

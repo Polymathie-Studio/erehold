@@ -95,13 +95,22 @@ class Record {
     this.prev = "genesis";
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   }
+  // Returns true once the line is in both files, false if either write failed. A failed write
+  // leaves the chain where it was, so the next line still follows the last one written.
   write(entry) {
-    const body = { seq: this.seq++, ts: new Date().toISOString(), session: this.session, ...entry, prev: this.prev };
+    const body = { seq: this.seq, ts: new Date().toISOString(), session: this.session, ...entry, prev: this.prev };
     const hash = crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex");
     const line = JSON.stringify({ ...body, hash }) + "\n";
-    fs.appendFileSync(this.file, line, { mode: 0o600 });
-    if (this.ledgerFile) fs.appendFileSync(this.ledgerFile, line, { mode: 0o600 });
+    try {
+      fs.appendFileSync(this.file, line, { mode: 0o600 });
+      if (this.ledgerFile) fs.appendFileSync(this.ledgerFile, line, { mode: 0o600 });
+    } catch (e) {
+      this.failure = e.code || "error";
+      return false;
+    }
+    this.seq++;
     this.prev = hash;
+    return true;
   }
 }
 
@@ -152,6 +161,9 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
   }
   const fingerprint = (value) => crypto.createHmac("sha256", recordKey).update(value).digest("hex").slice(0, 32);
   let open = true;
+  // Once a record write fails, the relay forwards nothing more: an action that cannot be
+  // recorded does not happen.
+  let recordBroken = false;
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://relay");
@@ -159,17 +171,24 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
     const entry = held.get(p);
     const base = { event: "request", provider: p || null, method: req.method, path: "/" + rest.join("/") };
     const refuse = (status, outcome) => {
-      record.write({ ...base, outcome, status });
+      if (!record.write({ ...base, outcome, status })) recordBroken = true;
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: `erehold: ${outcome}` }));
       req.resume();
     };
     if (!open) return refuse(503, "refused: session closed");
+    if (recordBroken) return refuse(503, "refused: the record cannot be written, so nothing is forwarded");
     if (!entry) return refuse(404, "refused: unknown provider");
     const got = presented(req, url);
     if (!got || !sameValue(got, entry.standin)) return refuse(403, "refused: not this session's stand-in");
 
     const spec = PROVIDERS[p];
+    // Write before acting: the crossing is on record before the real key leaves.
+    const destination = (upstream?.[p] ? new URL(upstream[p]) : new URL(`https://${spec.host}`)).host;
+    if (!record.write({ event: "forwarding", provider: p, method: req.method, path: base.path, key: entry.name, destination })) {
+      recordBroken = true;
+      return refuse(503, "refused: the record cannot be written, so nothing is forwarded");
+    }
     const headers = {};
     for (const [k, v] of Object.entries(req.headers)) if (!STRIP.has(k.toLowerCase())) headers[k] = v;
     spec.setAuth(headers, entry.value);
@@ -185,15 +204,17 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
     }, (ures) => {
       let bytesIn = 0;
       ures.on("data", (c) => { bytesIn += c.length; });
-      ures.on("end", () => record.write({
-        ...base, outcome: "forwarded", status: ures.statusCode, key: entry.name,
-        fingerprint: fingerprint(entry.value), destination: target.host, bytesOut, bytesIn,
-      }));
+      ures.on("end", () => {
+        if (!record.write({
+          ...base, outcome: "forwarded", status: ures.statusCode, key: entry.name,
+          fingerprint: fingerprint(entry.value), destination: target.host, bytesOut, bytesIn,
+        })) recordBroken = true;
+      });
       res.writeHead(ures.statusCode, ures.headers);
       ures.pipe(res);
     });
     up.on("error", (e) => {
-      record.write({ ...base, outcome: "upstream error", error: e.code || "error", key: entry.name, destination: target.host });
+      if (!record.write({ ...base, outcome: "upstream error", error: e.code || "error", key: entry.name, destination: target.host })) recordBroken = true;
       if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "erehold: upstream error" }));
     });
@@ -202,16 +223,19 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
-  record.write({
+  const opened = record.write({
     event: "open", holder,
     ledger: ledgerFile ? { file: ledgerFile, protection: ledgerProtection(ledgerFile) } : null,
     keys: [...held.entries()].map(([p, e]) => ({ provider: p, key: e.name, fingerprint: fingerprint(e.value) })),
   });
 
+  if (!opened) { await new Promise((resolve) => server.close(resolve)); throw new Error(`the session record cannot be written (${record.failure}); nothing was started`); }
+
   return {
     id,
     port,
     recordFile: record.file,
+    recordHealthy: () => !recordBroken,
     // The child's environment: the allow list from parentEnv, plus stand-ins and relay addresses.
     childEnv(parentEnv = process.env, pass = []) {
       const env = {};
@@ -228,7 +252,7 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
       open = false;
       held.clear();
       await new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); });
-      record.write({ event: "close", childExit: exitCode });
+      if (!record.write({ event: "close", childExit: exitCode })) process.stderr.write(`erehold: the closing line could not be written (${record.failure})\n`);
     },
   };
 }

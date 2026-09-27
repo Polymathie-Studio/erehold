@@ -168,6 +168,20 @@ check("10. the append-only ledger refuses rewriting and still accepts additions"
 execFileSync("chflags", ["nouappnd", ledger]);
 fs.rmSync(ledgerDir, { recursive: true, force: true });
 
+// 11. An action that cannot be recorded does not happen: with the record unwritable, the relay
+// refuses, the provider is never reached, and erehold keeps running rather than crashing.
+const nwDir = fs.mkdtempSync(path.join(os.tmpdir(), "erehold-nowrite-"));
+const before = seen.length;
+const s3 = await startSession({ secrets: { anthropic: CANARY_A }, recordDir: nwDir, recordKey: "k", upstream: { anthropic: UP } });
+fs.chmodSync(s3.recordFile, 0o400);
+const post3 = () => fetch(`http://127.0.0.1:${s3.port}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": s3.childEnv({}).ANTHROPIC_API_KEY }, body: "{}" }).then((r) => r.status, () => "FAIL");
+const first = await post3(), second = await post3();
+check("11. with the record unwritable, the request is refused (503) and never reaches the provider", first === 503 && seen.length === before);
+check("11. erehold keeps refusing, and keeps running, once the record has failed", second === 503 && !s3.recordHealthy());
+fs.chmodSync(s3.recordFile, 0o600);
+await s3.close(0);
+fs.rmSync(nwDir, { recursive: true, force: true });
+
 fake.close();
 fs.rmSync(recordDir, { recursive: true, force: true });
 console.log(`\n${passed} passed, ${failed} failed`);
