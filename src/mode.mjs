@@ -30,6 +30,14 @@ const TRUSTED = ["managed", "user", "preset"];
 // Variables erehold sets itself. No mode may pass them through.
 export const RESERVED_VARS = Object.values(PROVIDERS).flatMap((s) => [s.envKey, s.envBase, ...(s.alsoEnvKeys ?? [])]);
 
+// erehold takes no settings from environment variables, so nothing a repository sets (a .env
+// file, direnv) can steer it or move its folders. The whole EREHOLD_ namespace is reserved:
+// such a variable in erehold's environment stops a session, and no mode may pass one through.
+export const RESERVED_PREFIX = "EREHOLD_";
+export function reservedInEnvironment(env) {
+  return Object.keys(env).filter((k) => k.startsWith(RESERVED_PREFIX));
+}
+
 // The four locations. `managedOwner` is the user id a managed folder must belong to (the
 // administrator, 0); the tests set it to their own id, since they cannot create such a folder.
 export function modeLocations(cwd, { home = os.homedir(), managedRoot = "/Library/Application Support/erehold", managedOwner = 0 } = {}) {
@@ -88,6 +96,7 @@ export function checkMode(written, cwd) {
   for (const v of pass) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v)) throw new Error(`"${v}" is not an environment variable name`);
     if (RESERVED_VARS.includes(v)) throw new Error(`"${v}" cannot be passed: erehold sets it itself`);
+    if (v.startsWith(RESERVED_PREFIX)) throw new Error(`"${v}" cannot be passed: names starting with ${RESERVED_PREFIX} are reserved for erehold`);
   }
   return Object.freeze({
     name: written.name ?? "unnamed",
@@ -116,7 +125,49 @@ export function isWithin(inner, outer, cwd) {
     inner.pass.every((v) => outer.pass.includes(v));
 }
 
-function readModeFile(file, cwd) {
+const hashFile = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+
+// The mode files a session must not change: every mode in the user and managed folders, and
+// the ceiling. Keyed by real path. A session records these when it opens and again when it
+// closes, so a change made during the session is on the record.
+export function modeFileHashes(locations) {
+  const out = {};
+  for (const dir of [locations.user, locations.managed]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      const f = path.join(dir, name);
+      if (name.endsWith(".json") && fs.statSync(f).isFile()) out[real(f)] = hashFile(f);
+    }
+  }
+  if (fs.existsSync(locations.ceiling)) out[real(locations.ceiling)] = hashFile(locations.ceiling);
+  return out;
+}
+
+// Mode files changed during a session and not accepted since, read from the ledger. Returns
+// { realPath: hashBefore }. A change is accepted by an "accept-mode" line carrying the file's
+// new hash, which `erehold accept-mode` writes after showing the mode to the person.
+export function unacceptedChanges(ledgerFile) {
+  const pending = {};
+  if (!ledgerFile || !fs.existsSync(ledgerFile)) return pending;
+  for (const line of fs.readFileSync(ledgerFile, "utf8").split("\n")) {
+    if (!line) continue;
+    let e;
+    try { e = JSON.parse(line); } catch { continue; }
+    if (e.event === "close" && Array.isArray(e.modesChanged)) {
+      for (const c of e.modesChanged) if (!(c.file in pending)) pending[c.file] = c.before;
+    }
+    if (e.event === "accept-mode" && e.file in pending) delete pending[e.file];
+  }
+  return pending;
+}
+
+function readModeFile(file, cwd, locations = null) {
+  if (locations?.pending) {
+    const key = real(file);
+    if (key in locations.pending && hashFile(file) !== locations.pending[key]) {
+      throw new Error(`${file} was changed during an erehold session and has not been accepted since; review it with \`erehold mode ${file}\`, then accept it with \`erehold accept-mode ${file}\``);
+    }
+  }
   let written;
   try { written = JSON.parse(fs.readFileSync(file, "utf8")); } catch { throw new Error(`${file} is not valid JSON`); }
   return checkMode(written, cwd);
@@ -163,7 +214,7 @@ export function loadMode(ref, cwd, locations = modeLocations(cwd), seen = new Se
   const key = real(file);
   if (seen.has(key)) throw new Error(`the modes declare themselves within each other in a loop`);
   seen.add(key);
-  const mode = readModeFile(file, cwd);
+  const mode = readModeFile(file, cwd, locations);
   checkWritesAvoidModes(mode, locations);
 
   // A project mode must stay within a mode from a trusted location: the one it names, or the
@@ -182,10 +233,34 @@ export function loadMode(ref, cwd, locations = modeLocations(cwd), seen = new Se
 
 // The managed ceiling, if an administrator has set one: every session's mode must stay within it.
 export function checkCeiling(mode, cwd, locations) {
+  // A ceiling removed during a session must not silently lift the limit it set.
+  if (locations.pending && real(locations.ceiling) in locations.pending && !fs.existsSync(locations.ceiling)) {
+    throw new Error(`the managed ceiling was removed during an erehold session and the removal has not been accepted; accept it with \`erehold accept-mode "${locations.ceiling}"\``);
+  }
   if (!managedIsGenuine(locations) || !fs.existsSync(locations.ceiling)) return null;
-  const ceiling = readModeFile(locations.ceiling, cwd);
+  const ceiling = readModeFile(locations.ceiling, cwd, locations);
   if (!isWithin(mode, ceiling, cwd)) throw new Error(`the mode "${mode.name}" allows more than the managed ceiling`);
   return { name: ceiling.name, hash: modeHash(ceiling) };
+}
+
+// Resolve what a session allows at the moment it is used, just before the command starts.
+// Each folder is taken to its real path, so the sandbox is given the folder itself and not a
+// link that could be pointed elsewhere during the session; a folder that does not exist is
+// refused rather than guessed; and the guarded-location check runs again on the real paths.
+// The working folder is checked too: running inside erehold's own folder, or a folder that
+// contains it, would make the modes and records writable. Returns { cwd, allowRead, allowWrite }.
+export function resolveAllowances(mode, cwd, locations) {
+  const resolve = (p) => {
+    if (!fs.existsSync(p)) throw new Error(`the allowed folder ${p} does not exist`);
+    return fs.realpathSync(p);
+  };
+  const resolved = Object.freeze({
+    cwd: resolve(cwd),
+    allowRead: Object.freeze(sortedUnique(mode.allowRead.map(resolve))),
+    allowWrite: Object.freeze(sortedUnique(mode.allowWrite.map(resolve))),
+  });
+  checkWritesAvoidModes({ name: mode.name, allowWrite: [resolved.cwd, ...resolved.allowWrite] }, locations);
+  return resolved;
 }
 
 // Read `erehold run` options. A session's mode comes either from --mode or from the options
@@ -214,7 +289,9 @@ export function modeFromArgs(args, cwd, locations = modeLocations(cwd)) {
 // What the record's opening line says about the mode: its name, where it came from and how far
 // that place is trusted, its hash, the mode it stays within, the ceiling it was checked against,
 // and everything it allows, including the working folder and the network limit.
-export function describeMode(mode, source, { cwd, trust = null, base = null, ceiling = null, alwaysUnreadable = [] }) {
+// When `resolved` is given (from resolveAllowances), the folders recorded are the real paths the
+// sandbox was actually given; the hash stays the hash of the mode as declared.
+export function describeMode(mode, source, { cwd, trust = null, base = null, ceiling = null, alwaysUnreadable = [], resolved = null }) {
   return {
     name: mode.name,
     source,
@@ -223,10 +300,10 @@ export function describeMode(mode, source, { cwd, trust = null, base = null, cei
     within: base ? { name: base.mode.name, source: base.source, hash: modeHash(base.mode) } : null,
     ceiling,
     sandbox: mode.sandbox,
-    workingFolder: cwd,
+    workingFolder: resolved?.cwd ?? cwd,
     network: mode.sandbox ? "erehold's relay only" : "not limited: the command runs without the sandbox",
-    allowRead: mode.allowRead,
-    allowWrite: mode.allowWrite,
+    allowRead: resolved?.allowRead ?? mode.allowRead,
+    allowWrite: resolved?.allowWrite ?? mode.allowWrite,
     pass: mode.pass,
     alwaysUnreadable: mode.sandbox ? alwaysUnreadable : [],
   };

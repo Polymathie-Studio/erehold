@@ -9,6 +9,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { startSession } from "../src/session.mjs";
 import { sandboxAvailable, sandboxCommand, SANDBOXED_LEVEL } from "../src/sandbox.mjs";
+import { checkMode, resolveAllowances, modeLocations } from "../src/mode.mjs";
 
 if (!sandboxAvailable()) { console.log("SKIP  sandbox tests: srt is not installed"); process.exit(0); }
 
@@ -72,6 +73,34 @@ check("S7. it can write in the working folder", out.writeWork === "WROTE" && fs.
 check("S8. it cannot write outside the working folder", String(out.writeOutside).startsWith("DENIED") && !fs.existsSync(outsideWrite));
 check("S9. the record declares the sandboxed holder level",
   JSON.parse(fs.readFileSync(session.recordFile, "utf8").split("\n")[0]).holder === SANDBOXED_LEVEL);
+
+// S10. An allowed folder reached through a link is given to the sandbox as its real path, so
+// pointing the link somewhere else during the session does not move the allowance.
+const dirA = fs.mkdtempSync(path.join(os.homedir(), "erehold-sbxtest-A-"));
+const dirB = fs.mkdtempSync(path.join(os.homedir(), "erehold-sbxtest-B-"));
+fs.writeFileSync(path.join(dirA, "note.txt"), "ALLOWED-A");
+fs.writeFileSync(path.join(dirB, "note.txt"), "SECRET-B");
+const link = path.join(work, "shared");
+fs.symlinkSync(dirA, link);
+const mode10 = checkMode({ "erehold-mode": 1, allowRead: ["shared"] }, work);
+const resolved10 = resolveAllowances(mode10, work, modeLocations(work));
+const script10 = `
+  const fs = require("fs");
+  const tryRead = (p) => { try { return fs.readFileSync(p, "utf8"); } catch (e) { return "DENIED:" + e.code; } };
+  const out = { before: tryRead("shared/note.txt") };
+  fs.unlinkSync("shared"); fs.symlinkSync(${JSON.stringify(dirB)}, "shared");
+  out.after = tryRead("shared/note.txt");
+  console.log(JSON.stringify(out));
+`;
+const sbx10 = sandboxCommand({ port: session.port, cwd: work, cmd: ["node", "-e", script10], allowRead: [...resolved10.allowRead] });
+const r10 = await new Promise((resolve) => execFile("srt", sbx10.argv, { cwd: work, env: session.childEnv(process.env), encoding: "utf8", timeout: 60000 },
+  (err, stdout, stderr) => resolve({ stdout, stderr })));
+let out10 = {};
+try { out10 = JSON.parse(r10.stdout.trim().split("\n").pop()); } catch { console.log(r10.stdout, r10.stderr); }
+check("S10. the allowed folder is readable through the link as given", out10.before === "ALLOWED-A");
+check("S10. re-pointing the link during the session does not move the allowance", String(out10.after).startsWith("DENIED"));
+sbx10.cleanup();
+for (const d of [dirA, dirB]) fs.rmSync(d, { recursive: true, force: true });
 
 await session.close(0);
 sbx.cleanup();

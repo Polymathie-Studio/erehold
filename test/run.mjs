@@ -12,7 +12,9 @@ import { startSession, verifyRecord, crossCheckLedger, ledgerProtection } from "
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { keysFromEnvFile } from "../src/envfile.mjs";
-import { checkMode, loadMode, modeFromArgs, modeHash, describeMode, modeLocations, checkCeiling, trustOf } from "../src/mode.mjs";
+import { checkMode, loadMode, modeFromArgs, modeHash, describeMode, modeLocations, checkCeiling, trustOf,
+  resolveAllowances, modeFileHashes, unacceptedChanges, reservedInEnvironment } from "../src/mode.mjs";
+import { recordEvent } from "../src/session.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const CANARY_A = "sk-ant-FAKE-canary-7f3e9a1c5b2d4e6f8a0b";
@@ -274,6 +276,59 @@ try { checkCeiling(noSandbox.mode, work12, locs); } catch { overCeiling = true; 
 check("13. a mode that allows more than the managed ceiling is refused", overCeiling);
 check("13. a mode within the managed ceiling passes, and the ceiling is reported", checkCeiling(research.mode, work12, locs)?.name === "ceiling");
 for (const d of [work12, home12, managed12, outside]) fs.rmSync(d, { recursive: true, force: true });
+
+// 14. Three gaps closed: the reserved EREHOLD_ namespace; allowances resolved to real paths at
+// the moment of use; mode files changed during a session recorded and refused until accepted.
+const work14 = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "erehold-g-work-")));
+const home14 = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "erehold-g-home-")));
+const managed14 = fs.mkdtempSync(path.join(os.tmpdir(), "erehold-g-managed-"));
+const locs14 = modeLocations(work14, { home: home14, managedRoot: managed14, managedOwner: process.getuid() });
+const refuses14 = (m) => { try { checkMode(m, work14); return false; } catch { return true; } };
+check("14. a mode may not pass an EREHOLD_ variable", refuses14({ "erehold-mode": 1, pass: ["EREHOLD_HOME"] }));
+check("14. EREHOLD_ variables in erehold's own environment are found, and nothing else is",
+  reservedInEnvironment({ EREHOLD_MODE: "x", PATH: "/bin", NOT_EREHOLD_X: "y" }).join() === "EREHOLD_MODE");
+
+const realA = fs.mkdtempSync(path.join(os.tmpdir(), "erehold-g-A-"));
+fs.symlinkSync(realA, path.join(work14, "link-to-A"));
+const viaLink = checkMode({ "erehold-mode": 1, allowRead: ["link-to-A"] }, work14);
+const resolvedA = resolveAllowances(viaLink, work14, locs14);
+check("14. an allowed folder reached through a link is resolved to the real folder the sandbox is given",
+  resolvedA.allowRead[0] === fs.realpathSync(realA) && resolvedA.cwd === work14);
+let missing = false;
+try { resolveAllowances(checkMode({ "erehold-mode": 1, allowRead: ["no-such-folder"] }, work14), work14, locs14); } catch { missing = true; }
+check("14. an allowed folder that does not exist at launch is refused", missing);
+fs.mkdirSync(locs14.ereholdHome, { recursive: true });
+let insideHome = false;
+try { resolveAllowances(checkMode({ "erehold-mode": 1 }, locs14.ereholdHome), locs14.ereholdHome, locs14); } catch { insideHome = true; }
+let aboveHome = false;
+try { resolveAllowances(checkMode({ "erehold-mode": 1 }, home14), home14, locs14); } catch { aboveHome = true; }
+check("14. running from inside erehold's own folder, or from a folder that contains it, is refused", insideHome && aboveHome);
+
+fs.mkdirSync(locs14.user, { recursive: true });
+const userMode = path.join(locs14.user, "work.json");
+fs.writeFileSync(userMode, JSON.stringify({ "erehold-mode": 1, name: "work" }));
+const ledger14 = path.join(home14, "ledger.jsonl");
+fs.writeFileSync(ledger14, "");
+const s5 = await startSession({ secrets: { anthropic: CANARY_A }, recordDir: work14, recordKey: "k", upstream: { anthropic: UP },
+  ledgerFile: ledger14, watch: () => modeFileHashes(locs14) });
+fs.writeFileSync(userMode, JSON.stringify({ "erehold-mode": 1, name: "work", sandbox: false }));
+const changed = await s5.close(0);
+const close5 = JSON.parse(fs.readFileSync(s5.recordFile, "utf8").trim().split("\n").at(-1));
+check("14. a mode file changed during a session is reported at close and written into the closing line",
+  changed.length === 1 && close5.modesChanged?.[0]?.file === fs.realpathSync(userMode) && verifyRecord(s5.recordFile).ok);
+locs14.pending = unacceptedChanges(ledger14);
+let refusedChanged = false;
+try { loadMode("work", work14, locs14); } catch (e) { refusedChanged = e.message.includes("accept-mode"); }
+check("14. that changed mode is refused until it is accepted", refusedChanged);
+const originalText = JSON.stringify({ "erehold-mode": 1, name: "work" });
+fs.writeFileSync(userMode, originalText);
+check("14. restoring the file to what it was before the session lifts the refusal", loadMode("work", work14, locs14).mode.sandbox === true);
+fs.writeFileSync(userMode, JSON.stringify({ "erehold-mode": 1, name: "work", sandbox: false }));
+recordEvent({ recordDir: work14, ledgerFile: ledger14, entry: { event: "accept-mode", file: fs.realpathSync(userMode), fileHash: "x" } });
+locs14.pending = unacceptedChanges(ledger14);
+check("14. once accepted, with the acceptance in the ledger, the changed mode loads", loadMode("work", work14, locs14).mode.sandbox === false);
+check("14. the acceptance line is in the ledger", fs.readFileSync(ledger14, "utf8").includes('"event":"accept-mode"'));
+for (const d of [work14, home14, managed14, realA]) fs.rmSync(d, { recursive: true, force: true });
 
 fake.close();
 fs.rmSync(recordDir, { recursive: true, force: true });

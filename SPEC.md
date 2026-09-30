@@ -1,4 +1,4 @@
-# erehold v0.4: specification
+# erehold v0.5: specification
 
 This is the build specification for the first working versions of erehold. The approach behind it is in `README.md`.
 
@@ -55,6 +55,12 @@ Where a mode file lives decides how far it is trusted. There are four locations,
 A name that exists in more than one location is refused, so a less trusted file can never stand in for a more trusted one of the same name. Trust follows where a file really is: a link in the user folder to a file elsewhere is trusted as that elsewhere. No mode may allow writing where erehold keeps modes or records (`~/.erehold`, the managed folder, the presets), since that would let a session change the rules for the next one. "Stays within" means: the sandbox stays on if the outer mode has it on, and every folder and variable the inner mode allows is one the outer mode allows, the working folder counting as allowed in every mode. The options `--allow-read`, `--allow-write`, `--pass`, and `--no-sandbox` build a mode instead, recorded as coming from options; using them together with `--mode` is refused, so a record never mixes a declared mode with changes made to it. One preset ships now: `lockdown`, the sandbox with nothing allowed beyond the working folder.
 
 Refusing rather than guessing applies to modes too: an unknown field, a wrong type, or a variable erehold sets itself stops the session before anything starts. A declared mode that needs the sandbox does not start if the sandbox runtime is not installed; a mode built from options falls back to running without the sandbox, as before, and the record then says `sandbox: false`.
+
+**Mode files a session changes.** With the sandbox on, the command can neither read nor write the user or managed mode folders. With it off, code running as you can change them, and erehold cannot prevent that. It records it instead. When a session opens, erehold writes a hash of every user and managed mode file, and of the ceiling, into the opening line; when it closes, it hashes them again and writes any difference into the closing line. A mode file changed during a session is then refused, and a ceiling removed during a session stops every session, until the person reviews it (`erehold mode <file>`) and accepts it (`erehold accept-mode <file>`), which writes an acceptance line to the ledger. Putting the file back as it was lifts the refusal without an acceptance. erehold also refuses to run from inside its own folder, the managed folder, or its presets, or from any folder that contains one of them, since the working folder is always writable.
+
+**Settings never come from the environment.** erehold reads no configuration from environment variables, so a repository's `.env` file or a shell hook cannot steer it or move its folders. The whole `EREHOLD_` namespace is reserved: such a variable in erehold's environment stops the session before anything starts, and no mode may pass one through.
+
+**Folders are resolved when they are used.** Just before the command starts, every allowed folder and the working folder are taken to their real paths, a folder that does not exist is refused, and the check against erehold's own folders runs again on those real paths. The sandbox is given the real paths, so a link inside the working folder that is pointed elsewhere during the session does not move what the session may read or write. The record states the real paths the sandbox was given; the mode's hash stays the hash of the mode as declared.
 
 The hash covers what a mode allows (the sandbox setting and the three allowances, normalized and sorted), not its name, so two modes that allow the same things have the same hash. `erehold mode <name or file>` shows a mode as erehold reads it, with that hash; `erehold verify` reports the mode a recorded session ran under. The hash is what another part of DFH can compare against to check that a session is running under the mode an action requires.
 
@@ -122,5 +128,16 @@ Location checks, in `test/run.mjs`, run against temporary folders standing in fo
 28. A link in the user folder to a file elsewhere gets project trust.
 29. A managed folder anyone can write to is not trusted as managed; one only its owner can write is.
 30. A mode that allows more than the managed ceiling is refused; one within it passes.
+
+Checks for the three rules above, in `test/run.mjs`:
+
+31. A mode may not pass an `EREHOLD_` variable, and `EREHOLD_` variables in erehold's own environment are found.
+32. An allowed folder reached through a link resolves to the real folder; one that does not exist at launch is refused; running from inside erehold's folder, or a folder that contains it, is refused.
+33. A mode file changed during a session is reported at close and written into the closing line, and the record still verifies.
+34. That mode is refused until accepted; putting the file back lifts the refusal; after an acceptance line reaches the ledger, the changed mode loads.
+
+And in `test/sandbox.mjs`, run for real inside `srt`:
+
+35. A folder allowed through a link is readable as given, and pointing the link at another folder during the session does not make that folder readable.
 
 One live run against the real Anthropic API completes end to end, done by hand with a real key.

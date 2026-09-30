@@ -114,6 +114,16 @@ class Record {
   }
 }
 
+// Write one event outside any session, such as a person accepting a changed mode file: its own
+// short record file, chained like a session's, and the same line added to the ledger. Returns
+// the record file's path, or throws if the line could not be written.
+export function recordEvent({ recordDir, ledgerFile = null, entry }) {
+  const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}-${entry.event}`;
+  const record = new Record(path.join(recordDir, `${id}.jsonl`), id, ledgerFile);
+  if (!record.write(entry)) throw new Error(`the record cannot be written (${record.failure})`);
+  return record.file;
+}
+
 // Compare a session's own record with its lines in the shared ledger. Returns { ok, error }.
 export function crossCheckLedger(sessionFile, ledgerFile) {
   const own = fs.readFileSync(sessionFile, "utf8").split("\n").filter(Boolean);
@@ -152,7 +162,9 @@ export function verifyRecord(file) {
 //   upstream:  test hook only, { provider: "http://127.0.0.1:port" }; the CLI never sets it
 //   mode:      what the session allows, as describeMode() in mode.mjs reports it; written into
 //              the opening line so the record shows exactly what the run was allowed to do
-export async function startSession({ secrets, keyNames = {}, recordDir, recordKey, upstream = null, holder = HOLDER_LEVEL, ledgerFile = null, mode = null }) {
+//   watch:     a function returning { file: hash } for the mode files the session must not
+//              change; called at open and at close, and any difference goes in the closing line
+export async function startSession({ secrets, keyNames = {}, recordDir, recordKey, upstream = null, holder = HOLDER_LEVEL, ledgerFile = null, mode = null, watch = null }) {
   const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
   const record = new Record(path.join(recordDir, `${id}.jsonl`), id, ledgerFile);
   const held = new Map();
@@ -225,8 +237,9 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
+  const watchedAtOpen = watch ? watch() : null;
   const opened = record.write({
-    event: "open", holder, mode,
+    event: "open", holder, mode, modeFiles: watchedAtOpen,
     ledger: ledgerFile ? { file: ledgerFile, protection: ledgerProtection(ledgerFile) } : null,
     keys: [...held.entries()].map(([p, e]) => ({ provider: p, key: e.name, fingerprint: fingerprint(e.value) })),
   });
@@ -249,12 +262,23 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
       }
       return env;
     },
+    // Returns the mode files that changed while the session was open (empty when none, or
+    // when nothing was watched).
     async close(exitCode = null) {
-      if (!open) return;
+      if (!open) return [];
       open = false;
       held.clear();
       await new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); });
-      if (!record.write({ event: "close", childExit: exitCode })) process.stderr.write(`erehold: the closing line could not be written (${record.failure})\n`);
+      let modesChanged = [];
+      if (watch) {
+        const now = watch();
+        const files = new Set([...Object.keys(watchedAtOpen), ...Object.keys(now)]);
+        modesChanged = [...files].sort().filter((f) => watchedAtOpen[f] !== now[f])
+          .map((f) => ({ file: f, before: watchedAtOpen[f] ?? null, after: now[f] ?? null }));
+      }
+      const closing = { event: "close", childExit: exitCode, ...(modesChanged.length ? { modesChanged } : {}) };
+      if (!record.write(closing)) process.stderr.write(`erehold: the closing line could not be written (${record.failure})\n`);
+      return modesChanged;
     },
   };
 }

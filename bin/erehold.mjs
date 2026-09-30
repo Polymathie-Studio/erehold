@@ -11,6 +11,7 @@
 //        --allow-write PATH   let the sandboxed command write one more folder
 //        --no-sandbox         run without the sandbox (holder level 2 instead of 3)
 //   erehold mode <NAME|FILE>              show a mode as erehold reads it, with its hash
+//   erehold accept-mode <FILE|NAME>       accept a mode file that changed during a session
 //   erehold verify <record.jsonl>         check a session record's chain, and compare it with the ledger
 //   erehold protect                       lock the shared ledger so it can only be added to
 
@@ -19,10 +20,11 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startSession, verifyRecord, crossCheckLedger, ledgerProtection, PROVIDERS, HOLDER_LEVEL } from "../src/session.mjs";
+import { startSession, recordEvent, verifyRecord, crossCheckLedger, ledgerProtection, PROVIDERS, HOLDER_LEVEL } from "../src/session.mjs";
 import { keysFromEnvFile } from "../src/envfile.mjs";
 import { sandboxAvailable, sandboxCommand, SANDBOXED_LEVEL, ALWAYS_DENY_READ } from "../src/sandbox.mjs";
-import { modeFromArgs, loadMode, checkMode, checkCeiling, modeHash, modeLocations, describeMode } from "../src/mode.mjs";
+import { modeFromArgs, loadMode, checkMode, checkCeiling, modeHash, modeLocations, describeMode, resolveAllowances,
+  modeFileHashes, unacceptedChanges, reservedInEnvironment, RESERVED_PREFIX, trustOf } from "../src/mode.mjs";
 
 const SERVICE = "erehold";
 const HOME = path.join(os.homedir(), ".erehold");
@@ -54,7 +56,11 @@ const USAGE_RUN = "usage: erehold run [--mode NAME|FILE | --pass VAR --allow-rea
 
 async function run(args) {
   const cwd = process.cwd();
+  const reserved = reservedInEnvironment(process.env);
+  if (reserved.length) { say(`${reserved.join(", ")} set in the environment; erehold takes no settings from environment variables and the ${RESERVED_PREFIX} names are reserved, so nothing was started`); process.exit(2); }
   const locations = modeLocations(cwd);
+  // Mode files changed during an earlier session are refused until the person accepts them.
+  locations.pending = unacceptedChanges(LEDGER);
   let declared;
   try { declared = modeFromArgs(args, cwd, locations); } catch (e) { say(`${e.message}`); say(USAGE_RUN); process.exit(2); }
   let { mode } = declared;
@@ -71,6 +77,9 @@ async function run(args) {
   let ceiling;
   try { ceiling = checkCeiling(mode, cwd, locations); } catch (e) { say(`${e.message}; nothing was started`); process.exit(1); }
   const useSandbox = mode.sandbox;
+  // Resolve every folder to its real path at the moment of use, and check them again there.
+  let resolved;
+  try { resolved = resolveAllowances(mode, cwd, locations); } catch (e) { say(`${e.message}; nothing was started`); process.exit(1); }
 
   const secrets = {};
   for (const p of Object.keys(PROVIDERS)) { const v = keychainRead(p); if (v) secrets[p] = v; }
@@ -78,8 +87,8 @@ async function run(args) {
 
   const holder = useSandbox ? SANDBOXED_LEVEL : HOLDER_LEVEL;
   if (!fs.existsSync(LEDGER)) { fs.mkdirSync(HOME, { recursive: true, mode: 0o700 }); fs.writeFileSync(LEDGER, "", { mode: 0o600 }); }
-  const described = describeMode(mode, source, { cwd, trust, base, ceiling, alwaysUnreadable: [os.homedir(), ...ALWAYS_DENY_READ] });
-  const session = await startSession({ secrets, recordDir: RECORDS, recordKey: recordKey(), holder, ledgerFile: LEDGER, mode: described });
+  const described = describeMode(mode, source, { cwd, trust, base, ceiling, resolved, alwaysUnreadable: [os.homedir(), ...ALWAYS_DENY_READ] });
+  const session = await startSession({ secrets, recordDir: RECORDS, recordKey: recordKey(), holder, ledgerFile: LEDGER, mode: described, watch: () => modeFileHashes(locations) });
   say(`session ${session.id}: ${Object.keys(secrets).join(", ")} via stand-ins`);
   say(`mode ${mode.name} (${source}), hash ${described.hash.slice(0, 16)}${base ? `, within ${base.mode.name}` : ""}${ceiling ? `, under the managed ceiling` : ""}`);
   say(`holder ${holder}`);
@@ -88,17 +97,20 @@ async function run(args) {
 
   let launch = [cmd[0], cmd.slice(1)], sandbox = null;
   if (useSandbox) {
-    sandbox = sandboxCommand({ port: session.port, cwd, cmd, allowRead: [...mode.allowRead], allowWrite: [...mode.allowWrite] });
+    sandbox = sandboxCommand({ port: session.port, cwd: resolved.cwd, cmd, allowRead: [...resolved.allowRead], allowWrite: [...resolved.allowWrite] });
     launch = ["srt", sandbox.argv];
   }
   const child = spawn(launch[0], launch[1], { stdio: "inherit", env: session.childEnv(process.env, [...mode.pass]) });
   const forward = (sig) => child.kill(sig);
   process.on("SIGINT", forward);
   process.on("SIGTERM", forward);
-  child.on("error", async (e) => { say(`could not start ${launch[0]}: ${e.message}`); sandbox?.cleanup(); await session.close(null); process.exit(127); });
+  const reportChanges = (changed) => {
+    for (const c of changed) say(`WARNING: ${c.file} was ${c.after === null ? "deleted" : c.before === null ? "created" : "changed"} while the session was open; it is on the record and will be refused until you review and accept it with: erehold accept-mode "${c.file}"`);
+  };
+  child.on("error", async (e) => { say(`could not start ${launch[0]}: ${e.message}`); sandbox?.cleanup(); reportChanges(await session.close(null)); process.exit(127); });
   child.on("exit", async (code, signal) => {
     sandbox?.cleanup();
-    await session.close(code ?? signal);
+    reportChanges(await session.close(code ?? signal));
     say(`session closed; check the record with: erehold verify "${session.recordFile}"`);
     process.exit(code ?? 1);
   });
@@ -144,6 +156,42 @@ function showMode(ref) {
   process.exit(0);
 }
 
+// Accept a mode file that changed during a session: show it as erehold reads it, then record
+// the acceptance, with the file's current hash, in the ledger. Only a changed file that is
+// still pending can be accepted, and the acceptance is itself on the record.
+function acceptMode(ref) {
+  if (!ref) { say("usage: erehold accept-mode <mode file path or name>"); process.exit(2); }
+  const cwd = process.cwd();
+  const locations = modeLocations(cwd);
+  let file = path.resolve(cwd, ref);
+  if (!fs.existsSync(file)) {
+    for (const dir of [locations.user, locations.managed]) {
+      const f = path.join(dir, `${ref}.json`);
+      if (fs.existsSync(f)) { file = f; break; }
+    }
+  }
+  const pending = unacceptedChanges(LEDGER);
+  const key = fs.existsSync(file) ? fs.realpathSync(file) : file;
+  if (!(key in pending)) { say(`${file} has no change awaiting acceptance`); process.exit(1); }
+  let hash = null;
+  if (fs.existsSync(file)) {
+    const text = fs.readFileSync(file, "utf8");
+    let written;
+    try { written = JSON.parse(text); } catch { say(`${file} is not valid JSON; fix it before accepting`); process.exit(1); }
+    let mode;
+    try { mode = checkMode(written, cwd); } catch (e) { say(`${file}: ${e.message}; fix it before accepting`); process.exit(1); }
+    hash = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+    process.stdout.write(JSON.stringify({ file: key, trust: trustOf(file, locations), ...mode, hash: modeHash(mode) }, null, 2) + "\n");
+  } else {
+    say(`${file} was deleted during a session; accepting records the deletion`);
+  }
+  if (!fs.existsSync(LEDGER)) { say("there is no ledger to record the acceptance in"); process.exit(1); }
+  try { recordEvent({ recordDir: RECORDS, ledgerFile: LEDGER, entry: { event: "accept-mode", file: key, fileHash: hash } }); }
+  catch (e) { say(`the acceptance could not be recorded (${e.message}); nothing changed`); process.exit(1); }
+  say(`accepted ${key}; the acceptance is in the ledger`);
+  process.exit(0);
+}
+
 function verify(file) {
   if (!file || !fs.existsSync(file)) { say("usage: erehold verify <record.jsonl>"); process.exit(2); }
   const r = verifyRecord(file);
@@ -174,9 +222,10 @@ if (cmd === "run") await run(rest);
 else if (cmd === "add") add(rest[0]);
 else if (cmd === "import") importEnv(rest[0]);
 else if (cmd === "mode") showMode(rest[0]);
+else if (cmd === "accept-mode") acceptMode(rest[0]);
 else if (cmd === "verify") verify(rest[0]);
 else if (cmd === "protect") protect();
 else {
-  process.stderr.write(`usage:\n  erehold add <${Object.keys(PROVIDERS).join("|")}>\n  erehold import <path/to/.env>\n  erehold run [--mode NAME|FILE | --pass VAR --allow-read PATH --allow-write PATH --no-sandbox] -- <command> [args...]\n  erehold mode <NAME|FILE>\n  erehold verify <record.jsonl>\n  erehold protect\n`);
+  process.stderr.write(`usage:\n  erehold add <${Object.keys(PROVIDERS).join("|")}>\n  erehold import <path/to/.env>\n  erehold run [--mode NAME|FILE | --pass VAR --allow-read PATH --allow-write PATH --no-sandbox] -- <command> [args...]\n  erehold mode <NAME|FILE>\n  erehold accept-mode <FILE|NAME>\n  erehold verify <record.jsonl>\n  erehold protect\n`);
   process.exit(cmd ? 2 : 0);
 }
