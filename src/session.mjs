@@ -150,7 +150,9 @@ export function verifyRecord(file) {
 //   recordDir: where the session record is written
 //   recordKey: secret used for the keyed fingerprints in the record
 //   upstream:  test hook only, { provider: "http://127.0.0.1:port" }; the CLI never sets it
-export async function startSession({ secrets, keyNames = {}, recordDir, recordKey, upstream = null, holder = HOLDER_LEVEL, ledgerFile = null }) {
+//   mode:      what the session allows, as describeMode() in mode.mjs reports it; written into
+//              the opening line so the record shows exactly what the run was allowed to do
+export async function startSession({ secrets, keyNames = {}, recordDir, recordKey, upstream = null, holder = HOLDER_LEVEL, ledgerFile = null, mode = null }) {
   const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
   const record = new Record(path.join(recordDir, `${id}.jsonl`), id, ledgerFile);
   const held = new Map();
@@ -224,7 +226,7 @@ export async function startSession({ secrets, keyNames = {}, recordDir, recordKe
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   const opened = record.write({
-    event: "open", holder,
+    event: "open", holder, mode,
     ledger: ledgerFile ? { file: ledgerFile, protection: ledgerProtection(ledgerFile) } : null,
     keys: [...held.entries()].map(([p, e]) => ({ provider: p, key: e.name, fingerprint: fingerprint(e.value) })),
   });

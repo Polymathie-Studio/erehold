@@ -15,7 +15,7 @@ export function sandboxAvailable() {
 
 // Places that commonly hold secrets. Denied even inside the working folder, because a more
 // specific deny wins over the working-folder allow.
-const ALWAYS_DENY_READ = [
+export const ALWAYS_DENY_READ = [
   "**/.env", "**/.env.*", "**/*.env", "**/.envrc",
   "~/.erehold", "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gh", "~/.netrc",
   "~/.anthropic_env", "~/.secrets.env", "~/Library/Keychains",

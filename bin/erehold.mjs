@@ -4,10 +4,13 @@
 //   erehold add <anthropic|openai|gemini> store a provider key in the macOS keychain (hidden prompt)
 //   erehold import <path/to/.env>         copy provider keys from a .env file into the keychain
 //   erehold run [options] -- <cmd>        run a command with stand-ins in place of the keys
+//        --mode NAME|FILE     run under a declared mode (a preset name, or a mode file)
+//        or, to build a mode from options:
 //        --pass VAR           let one more environment variable through to the command
 //        --allow-read PATH    let the sandboxed command read one more folder
 //        --allow-write PATH   let the sandboxed command write one more folder
 //        --no-sandbox         run without the sandbox (holder level 2 instead of 3)
+//   erehold mode <NAME|FILE>              show a mode as erehold reads it, with its hash
 //   erehold verify <record.jsonl>         check a session record's chain, and compare it with the ledger
 //   erehold protect                       lock the shared ledger so it can only be added to
 
@@ -18,7 +21,8 @@ import os from "node:os";
 import path from "node:path";
 import { startSession, verifyRecord, crossCheckLedger, ledgerProtection, PROVIDERS, HOLDER_LEVEL } from "../src/session.mjs";
 import { keysFromEnvFile } from "../src/envfile.mjs";
-import { sandboxAvailable, sandboxCommand, SANDBOXED_LEVEL } from "../src/sandbox.mjs";
+import { sandboxAvailable, sandboxCommand, SANDBOXED_LEVEL, ALWAYS_DENY_READ } from "../src/sandbox.mjs";
+import { modeFromArgs, loadMode, checkMode, checkCeiling, modeHash, modeLocations, describeMode } from "../src/mode.mjs";
 
 const SERVICE = "erehold";
 const HOME = path.join(os.homedir(), ".erehold");
@@ -46,25 +50,27 @@ function recordKey() {
   return fs.readFileSync(f, "utf8").trim();
 }
 
+const USAGE_RUN = "usage: erehold run [--mode NAME|FILE | --pass VAR --allow-read PATH --allow-write PATH --no-sandbox] -- <command> [args...]";
+
 async function run(args) {
-  const pass = [], allowRead = [], allowWrite = [];
-  let useSandbox = true;
-  let i = 0;
-  for (; i < args.length && args[i] !== "--"; i++) {
-    if (args[i] === "--pass" && args[i + 1]) pass.push(args[++i]);
-    else if (args[i] === "--allow-read" && args[i + 1]) allowRead.push(path.resolve(args[++i]));
-    else if (args[i] === "--allow-write" && args[i + 1]) allowWrite.push(path.resolve(args[++i]));
-    else if (args[i] === "--no-sandbox") useSandbox = false;
-    else { say(`unknown option ${args[i]}`); process.exit(2); }
+  const cwd = process.cwd();
+  const locations = modeLocations(cwd);
+  let declared;
+  try { declared = modeFromArgs(args, cwd, locations); } catch (e) { say(`${e.message}`); say(USAGE_RUN); process.exit(2); }
+  let { mode } = declared;
+  const { source, trust, base, cmd, fromOptions } = declared;
+  if (!cmd.length) { say(USAGE_RUN); process.exit(2); }
+  if (mode.sandbox && !sandboxAvailable()) {
+    const install = "install it with: npm install -g @anthropic-ai/sandbox-runtime";
+    // A declared mode that needs the sandbox cannot be honored without it, so nothing starts.
+    if (!fromOptions) { say(`the mode "${mode.name}" runs the command in the sandbox, and the sandbox runtime (srt) is not installed; nothing was started. ${install}`); process.exit(1); }
+    say(`the sandbox runtime (srt) is not installed, so the command runs without it; ${install}`);
+    mode = checkMode({ "erehold-mode": 1, name: mode.name, sandbox: false, allowRead: mode.allowRead, allowWrite: mode.allowWrite, pass: mode.pass }, cwd);
   }
-  const cmd = args.slice(i + 1);
-  if (!cmd.length) { say("usage: erehold run [--pass VAR] [--allow-read PATH] [--allow-write PATH] [--no-sandbox] -- <command> [args...]"); process.exit(2); }
-  if (useSandbox && !sandboxAvailable()) {
-    say("the sandbox runtime (srt) is not installed, so the command runs without it; install it with: npm install -g @anthropic-ai/sandbox-runtime");
-    useSandbox = false;
-  }
-  const blocked = pass.filter((v) => Object.values(PROVIDERS).some((s) => [s.envKey, s.envBase, ...(s.alsoEnvKeys ?? [])].includes(v)));
-  if (blocked.length) { say(`refusing to pass ${blocked.join(", ")}: erehold sets these itself`); process.exit(2); }
+  // Checked after any fallback, so the mode that actually runs is the one held to the ceiling.
+  let ceiling;
+  try { ceiling = checkCeiling(mode, cwd, locations); } catch (e) { say(`${e.message}; nothing was started`); process.exit(1); }
+  const useSandbox = mode.sandbox;
 
   const secrets = {};
   for (const p of Object.keys(PROVIDERS)) { const v = keychainRead(p); if (v) secrets[p] = v; }
@@ -72,18 +78,20 @@ async function run(args) {
 
   const holder = useSandbox ? SANDBOXED_LEVEL : HOLDER_LEVEL;
   if (!fs.existsSync(LEDGER)) { fs.mkdirSync(HOME, { recursive: true, mode: 0o700 }); fs.writeFileSync(LEDGER, "", { mode: 0o600 }); }
-  const session = await startSession({ secrets, recordDir: RECORDS, recordKey: recordKey(), holder, ledgerFile: LEDGER });
+  const described = describeMode(mode, source, { cwd, trust, base, ceiling, alwaysUnreadable: [os.homedir(), ...ALWAYS_DENY_READ] });
+  const session = await startSession({ secrets, recordDir: RECORDS, recordKey: recordKey(), holder, ledgerFile: LEDGER, mode: described });
   say(`session ${session.id}: ${Object.keys(secrets).join(", ")} via stand-ins`);
+  say(`mode ${mode.name} (${source}), hash ${described.hash.slice(0, 16)}${base ? `, within ${base.mode.name}` : ""}${ceiling ? `, under the managed ceiling` : ""}`);
   say(`holder ${holder}`);
   say(`record ${session.recordFile}`);
   say(PROTECTION[ledgerProtection(LEDGER)]);
 
   let launch = [cmd[0], cmd.slice(1)], sandbox = null;
   if (useSandbox) {
-    sandbox = sandboxCommand({ port: session.port, cwd: process.cwd(), cmd, allowRead, allowWrite });
+    sandbox = sandboxCommand({ port: session.port, cwd, cmd, allowRead: [...mode.allowRead], allowWrite: [...mode.allowWrite] });
     launch = ["srt", sandbox.argv];
   }
-  const child = spawn(launch[0], launch[1], { stdio: "inherit", env: session.childEnv(process.env, pass) });
+  const child = spawn(launch[0], launch[1], { stdio: "inherit", env: session.childEnv(process.env, [...mode.pass]) });
   const forward = (sig) => child.kill(sig);
   process.on("SIGINT", forward);
   process.on("SIGTERM", forward);
@@ -126,11 +134,24 @@ function importEnv(file) {
   say(`${file} was not changed and still holds these keys in plain text; any program running as you can read it`);
 }
 
+// Show a mode as erehold reads it: normalized, with the hash a session records for it.
+function showMode(ref) {
+  if (!ref) { say("usage: erehold mode <preset name | mode file>"); process.exit(2); }
+  let loaded;
+  try { loaded = loadMode(ref, process.cwd()); } catch (e) { say(e.message); process.exit(2); }
+  const within = loaded.base ? { name: loaded.base.mode.name, source: loaded.base.source, hash: modeHash(loaded.base.mode) } : null;
+  process.stdout.write(JSON.stringify({ ...loaded.mode, source: loaded.source, trust: loaded.trust, within, hash: modeHash(loaded.mode) }, null, 2) + "\n");
+  process.exit(0);
+}
+
 function verify(file) {
   if (!file || !fs.existsSync(file)) { say("usage: erehold verify <record.jsonl>"); process.exit(2); }
   const r = verifyRecord(file);
   if (!r.ok) { say(`record FAILED verification: ${r.error}`); process.exit(1); }
   say(`record intact: ${r.lines} lines, chain verified`);
+  const opening = JSON.parse(fs.readFileSync(file, "utf8").split("\n")[0]);
+  if (opening.mode) say(`ran under mode ${opening.mode.name} (${opening.mode.source}), hash ${opening.mode.hash}`);
+  else say("the record does not declare a mode (written before erehold 0.4)");
   if (!fs.existsSync(LEDGER)) { say("no ledger to compare with"); process.exit(0); }
   const c = crossCheckLedger(file, LEDGER);
   if (!c.ok) { say(`record DIFFERS from the ledger: ${c.error}`); process.exit(1); }
@@ -152,9 +173,10 @@ const [cmd, ...rest] = process.argv.slice(2);
 if (cmd === "run") await run(rest);
 else if (cmd === "add") add(rest[0]);
 else if (cmd === "import") importEnv(rest[0]);
+else if (cmd === "mode") showMode(rest[0]);
 else if (cmd === "verify") verify(rest[0]);
 else if (cmd === "protect") protect();
 else {
-  process.stderr.write(`usage:\n  erehold add <${Object.keys(PROVIDERS).join("|")}>\n  erehold import <path/to/.env>\n  erehold run [--pass VAR] [--allow-read PATH] [--allow-write PATH] [--no-sandbox] -- <command> [args...]\n  erehold verify <record.jsonl>\n  erehold protect\n`);
+  process.stderr.write(`usage:\n  erehold add <${Object.keys(PROVIDERS).join("|")}>\n  erehold import <path/to/.env>\n  erehold run [--mode NAME|FILE | --pass VAR --allow-read PATH --allow-write PATH --no-sandbox] -- <command> [args...]\n  erehold mode <NAME|FILE>\n  erehold verify <record.jsonl>\n  erehold protect\n`);
   process.exit(cmd ? 2 : 0);
 }

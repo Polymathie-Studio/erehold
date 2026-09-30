@@ -1,0 +1,8 @@
+{
+  "erehold-mode": 1,
+  "name": "lockdown",
+  "sandbox": true,
+  "allowRead": [],
+  "allowWrite": [],
+  "pass": []
+}

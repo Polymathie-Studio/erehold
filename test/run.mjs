@@ -12,6 +12,7 @@ import { startSession, verifyRecord, crossCheckLedger, ledgerProtection } from "
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { keysFromEnvFile } from "../src/envfile.mjs";
+import { checkMode, loadMode, modeFromArgs, modeHash, describeMode, modeLocations, checkCeiling, trustOf } from "../src/mode.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const CANARY_A = "sk-ant-FAKE-canary-7f3e9a1c5b2d4e6f8a0b";
@@ -181,6 +182,98 @@ check("11. erehold keeps refusing, and keeps running, once the record has failed
 fs.chmodSync(s3.recordFile, 0o600);
 await s3.close(0);
 fs.rmSync(nwDir, { recursive: true, force: true });
+
+// 12. Modes: a declared profile of what a session allows, checked, fixed, and recorded with its hash.
+const work12 = fs.mkdtempSync(path.join(os.tmpdir(), "erehold-mode-"));
+const home12 = fs.mkdtempSync(path.join(os.tmpdir(), "erehold-home-"));
+const managed12 = fs.mkdtempSync(path.join(os.tmpdir(), "erehold-managed-"));
+const locs = modeLocations(work12, { home: home12, managedRoot: managed12, managedOwner: process.getuid() });
+const refuses = (m) => { try { checkMode(m, work12); return false; } catch { return true; } };
+const lock = loadMode("lockdown", work12, locs);
+check("12. the lockdown preset loads: sandbox on, nothing allowed beyond the working folder",
+  lock.source === "preset:lockdown" && lock.mode.name === "lockdown" && lock.mode.sandbox === true &&
+  !lock.mode.allowRead.length && !lock.mode.allowWrite.length && !lock.mode.pass.length);
+check("12. a mode missing its format declaration is refused", refuses({ sandbox: true }));
+check("12. a mode with an unknown field is refused", refuses({ "erehold-mode": 1, allowNetwork: ["example.com"] }));
+check("12. a mode with a wrong type is refused", refuses({ "erehold-mode": 1, sandbox: "yes" }) && refuses({ "erehold-mode": 1, allowRead: "/tmp" }));
+check("12. a mode may not pass a variable erehold sets itself", refuses({ "erehold-mode": 1, pass: ["ANTHROPIC_API_KEY"] }));
+check("12. a mode may not pass something that is not a variable name", refuses({ "erehold-mode": 1, pass: ["A=B"] }));
+const mA = checkMode({ "erehold-mode": 1, name: "a", allowRead: ["x", "y"], pass: ["B", "A"] }, work12);
+const mB = checkMode({ "erehold-mode": 1, name: "b", allowRead: ["y", "x"], pass: ["A", "B"] }, work12);
+const mC = checkMode({ "erehold-mode": 1, name: "a", allowRead: ["x"], pass: ["A", "B"] }, work12);
+check("12. the hash covers what a mode allows, not its name or the order it lists things in", modeHash(mA) === modeHash(mB));
+check("12. the hash changes when an allowance changes", modeHash(mA) !== modeHash(mC));
+check("12. a missing sandbox field means the sandbox, the stricter choice", checkMode({ "erehold-mode": 1 }, work12).sandbox === true);
+check("12. relative folders are resolved against the working folder", mA.allowRead.includes(path.join(work12, "x")));
+let frozen = false;
+try { "use strict"; mA.allowRead.push("/"); } catch { frozen = true; }
+check("12. a checked mode is fixed: it cannot be changed after it is read", frozen && Object.isFrozen(mA));
+const fromOpts = modeFromArgs(["--allow-read", "docs", "--pass", "FOO", "--", "cmd", "arg"], work12, locs);
+check("12. options build a mode, recorded as coming from options",
+  fromOpts.source === "options" && fromOpts.fromOptions && fromOpts.mode.pass[0] === "FOO" && fromOpts.cmd.join(" ") === "cmd arg");
+let both = false;
+try { modeFromArgs(["--mode", "lockdown", "--pass", "FOO", "--", "cmd"], work12, locs); } catch { both = true; }
+check("12. --mode and mode-building options together are refused", both);
+const modeFile = path.join(work12, "mine.json");
+fs.writeFileSync(modeFile, JSON.stringify({ "erehold-mode": 1, name: "mine", allowWrite: ["out"] }));
+const fromFile = modeFromArgs(["--mode", "mine.json", "--", "cmd"], work12, locs);
+check("12. a mode file outside the trusted folders is read with project trust, within lockdown",
+  fromFile.source === `project:${modeFile}` && fromFile.trust === "project" && fromFile.base?.mode.name === "lockdown" &&
+  fromFile.mode.allowWrite[0] === path.join(work12, "out"));
+const described = describeMode(fromFile.mode, fromFile.source, { cwd: work12, trust: fromFile.trust, base: fromFile.base, alwaysUnreadable: ["~/.ssh"] });
+const s4 = await startSession({ secrets: { anthropic: CANARY_A }, recordDir: work12, recordKey: "k", upstream: { anthropic: UP }, mode: described });
+await s4.close(0);
+const open4 = JSON.parse(fs.readFileSync(s4.recordFile, "utf8").split("\n")[0]);
+check("12. the record's opening line declares the mode: name, source, hash, and every allowance",
+  open4.mode?.name === "mine" && open4.mode?.hash === modeHash(fromFile.mode) && open4.mode?.workingFolder === work12 &&
+  open4.mode?.allowWrite?.[0] === path.join(work12, "out") && open4.mode?.network === "erehold's relay only" &&
+  open4.mode?.alwaysUnreadable?.[0] === "~/.ssh" && open4.mode?.trust === "project" && open4.mode?.within?.name === "lockdown");
+check("12. a record with a declared mode still verifies", verifyRecord(s4.recordFile).ok);
+const shown = execFileSync(process.execPath, [path.join(ROOT, "bin", "erehold.mjs"), "mode", "lockdown"], { encoding: "utf8" });
+check("12. `erehold mode` shows a mode with the hash a session records for it", JSON.parse(shown).hash === modeHash(lock.mode));
+// 13. The four locations: managed, user, preset, project, trusted in that order.
+const writeMode = (dir, name, body) => { fs.mkdirSync(dir, { recursive: true }); const f = path.join(dir, `${name}.json`); fs.writeFileSync(f, JSON.stringify({ "erehold-mode": 1, name, ...body })); return f; };
+const refusesLoad = (ref) => { try { loadMode(ref, work12, locs); return false; } catch { return true; } };
+const outside = fs.mkdtempSync(path.join(os.tmpdir(), "erehold-outside-"));
+writeMode(locs.user, "research", { allowRead: [outside] });
+const research = loadMode("research", work12, locs);
+check("13. a mode in the user folder loads with user trust", research.trust === "user" && research.source === "user:research");
+writeMode(locs.user, "lockdown", {});
+check("13. a name that exists in two places is refused", refusesLoad("lockdown"));
+fs.rmSync(path.join(locs.user, "lockdown.json"));
+writeMode(locs.project, "wide", { allowRead: [outside] });
+check("13. a project mode that allows more than lockdown is refused", refusesLoad("wide"));
+writeMode(locs.project, "narrow", { within: "research", allowRead: [outside] });
+const narrow = loadMode("narrow", work12, locs);
+check("13. a project mode within a user mode that allows the same folder loads, and names its base",
+  narrow.trust === "project" && narrow.base?.mode.name === "research" && narrow.base?.trust === "user");
+writeMode(locs.project, "open", { within: "research", sandbox: false });
+check("13. a project mode cannot turn the sandbox off inside a sandboxed base", refusesLoad("open"));
+writeMode(locs.project, "chained", { within: "narrow" });
+check("13. a project mode cannot stay within another project mode", refusesLoad("chained"));
+writeMode(locs.user, "selfedit", { allowWrite: [locs.ereholdHome] });
+check("13. a mode that allows writing where erehold keeps modes or records is refused", refusesLoad("selfedit"));
+writeMode(locs.user, "loop-a", { within: "loop-b" });
+writeMode(locs.user, "loop-b", { within: "loop-a" });
+check("13. modes declared within each other in a loop are refused", refusesLoad("loop-a"));
+const target = writeMode(outside, "linked", { allowRead: [outside] });
+fs.symlinkSync(target, path.join(locs.user, "linked.json"));
+const linked = (() => { try { return loadMode("linked", work12, locs); } catch (e) { return { error: e.message }; } })();
+check("13. a link in the user folder to a file elsewhere gets project trust, not user trust",
+  trustOf(path.join(locs.user, "linked.json"), locs) === "project" && String(linked.error).includes("allows more than"));
+writeMode(locs.managed, "team", { allowRead: [outside] });
+fs.chmodSync(locs.managed, 0o777);
+check("13. a managed folder anyone can write to is not trusted as managed",
+  refusesLoad("team") && trustOf(path.join(locs.managed, "team.json"), locs) === "project");
+fs.chmodSync(locs.managed, 0o755);
+check("13. a managed folder only its owner can write is trusted as managed", loadMode("team", work12, locs).trust === "managed");
+fs.writeFileSync(locs.ceiling, JSON.stringify({ "erehold-mode": 1, name: "ceiling", sandbox: true, allowRead: [outside] }));
+const noSandbox = modeFromArgs(["--no-sandbox", "--", "cmd"], work12, locs);
+let overCeiling = false;
+try { checkCeiling(noSandbox.mode, work12, locs); } catch { overCeiling = true; }
+check("13. a mode that allows more than the managed ceiling is refused", overCeiling);
+check("13. a mode within the managed ceiling passes, and the ceiling is reported", checkCeiling(research.mode, work12, locs)?.name === "ceiling");
+for (const d of [work12, home12, managed12, outside]) fs.rmSync(d, { recursive: true, force: true });
 
 fake.close();
 fs.rmSync(recordDir, { recursive: true, force: true });
